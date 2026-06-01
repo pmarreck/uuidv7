@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+
+# Force local generation (never route to a daemon) so these tests are deterministic.
+export UUIDV7_NO_DAEMON=1
+# Contract test for the RFC 9562 UUIDv7 bit layout with nanosecond precision +
+# monotonic counter. Feeds a fixed nanosecond value and asserts every field that
+# the nanosecond drives, plus counter-increment behavior on a repeated nanosecond.
+#
+# Layout under test:
+#   bits  0-47  unix_ts_ms (ms)
+#   bits 48-51  ver = 0111
+#   bits 52-63  rand_a = ns-within-ms, high 12 bits
+#   bits 64-65  var = 10
+#   bits 66-73  rand_b.hi = ns-within-ms, low 8 bits   (20-bit ns total)
+#   bits 74-127 counter (54 bits), random-init per ns tick, ++ on same ns
+
+set -u
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PATH="$here/../bin:$PATH"
+
+tests=0
+fails=0
+assert_eq() {
+	(( tests++ ))
+	if [[ "$2" == "$3" ]]; then
+		echo "✓ $1 ($2)"
+	else
+		echo "✗ $1: expected '$3', got '$2'" >&2
+		(( fails++ ))
+	fi
+}
+
+# Isolate the shared counter state so the first call is a fresh tick.
+TMPDIR="$(mktemp -d)"; export TMPDIR
+trap 'rm -rf "$TMPDIR"' EXIT
+
+# Fixed inputs: RFC A.6 millisecond + a deliberately bit-spread sub-ms nanosecond.
+MS=1645557742000          # 0x017F22E279B0  (RFC 9562 A.6 timestamp)
+NS_IN_MS=524287           # 0x7FFFF
+NT=$(( MS * 1000000 + NS_IN_MS ))   # 1645557742000524287  (> 2^53; needs 64-bit parse)
+
+NS_HI12=$(( (NS_IN_MS >> 8) & 0xFFF ))   # 0x7FF
+NS_LO8=$(( NS_IN_MS & 0xFF ))            # 0xFF
+
+u1=$(uuidv7 "$NT")
+echo "uuid1 = $u1"
+assert_eq "length is 32 hex" "${#u1}" "32"
+
+# Field extraction (hex string, 2 chars per byte)
+ms_hex=${u1:0:12}
+ver_nibble=${u1:12:1}
+rand_a_hex=${u1:13:3}
+byte8=$((16#${u1:16:2}))
+byte9=$((16#${u1:18:2}))
+
+assert_eq "unix_ts_ms"       "$ms_hex"               "$(printf '%012x' "$MS")"
+assert_eq "version nibble"   "$ver_nibble"           "7"
+assert_eq "rand_a = ns hi12" "$((16#$rand_a_hex))"   "$NS_HI12"
+assert_eq "variant bits"     "$(( byte8 >> 6 ))"     "2"   # 0b10
+assert_eq "rand_b.hi top6 = ns_lo8>>2" "$(( byte8 & 0x3F ))" "$(( NS_LO8 >> 2 ))"
+assert_eq "rand_b next2 = ns_lo8 low2"  "$(( byte9 >> 6 ))"  "$(( NS_LO8 & 0x3 ))"
+
+# Counter occupies bits 74-127: low 6 bits of byte9 + bytes 10..15 (12 hex)
+counter_of() {  # $1 = uuid hex -> 54-bit counter as decimal
+	local b9=$((16#${1:18:2}))
+	local rest=$((16#${1:20:12}))
+	echo $(( ((b9 & 0x3F) << 48) | rest ))
+}
+c1=$(counter_of "$u1")
+
+# Same nanosecond again -> counter must increment by exactly 1 (shared state).
+u2=$(uuidv7 "$NT")
+echo "uuid2 = $u2"
+c2=$(counter_of "$u2")
+assert_eq "counter increments on same ns" "$(( c2 - c1 ))" "1"
+
+# A different (later) nanosecond -> ns fields change, full value strictly greater.
+u3=$(uuidv7 "$(( NT + 1 ))")
+assert_eq "later ns sorts after (strict monotonic)" "$([[ "$u3" > "$u2" ]] && echo yes || echo no)" "yes"
+
+if (( fails > 0 )); then
+	echo "$fails of $tests layout tests failed!" >&2
+else
+	echo "All $tests layout tests passed!"
+fi
+exit "$fails"

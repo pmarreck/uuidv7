@@ -1,0 +1,54 @@
+#!/usr/bin/env luajit
+-- Microbenchmark: how many valid, unique, unhyphenated UUIDv7s can we produce per
+-- second in-process (the generator's ceiling — no socket, no process spawn)?
+--
+-- Each UUID costs at least one clock_gettime (timestamp) and, on every new-nanosecond
+-- tick, one getrandom/getentropy (counter seed), so this is largely syscall-bound — it
+-- reflects real production cost, not a fantasy tight-loop number.
+--
+-- Usage: bench/uuidv7_bench [count]   (default 2,000,000)
+
+local self_dir = (arg and arg[0] or ""):match("^(.*)/[^/]+$") or "."
+package.path = self_dir .. "/../lib/?.lua;" .. package.path
+local core = require("uuidv7_core")
+
+local N = tonumber(arg and arg[1]) or 2000000
+local gen, fmt = core.generate_bytes, core.format_uuid
+local counter = core.new_counter("memory")
+
+-- warm up the JIT
+for _ = 1, 100000 do fmt(gen(counter), false) end
+
+-- timed run; touch each string (byte 1) so nothing is optimized away
+local sink = 0
+local t0 = core.get_nanotime()
+for _ = 1, N do
+	local s = fmt(gen(counter), false)
+	sink = sink + s:byte(1)
+end
+local t1 = core.get_nanotime()
+
+local secs = tonumber(t1 - t0) / 1e9
+local rate = N / secs
+io.write(string.format("produced %d unhyphenated UUIDv7s in %.3f s\n", N, secs))
+io.write(string.format("  rate : %s /s  (%.2f M/s)\n", ("%.0f"):format(rate):reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", ""), rate / 1e6))
+io.write(string.format("  cost : %.1f ns per UUID\n", secs / N * 1e9))
+
+-- correctness on a sample: strictly increasing (=> unique AND sorted) + valid ver/variant
+local M = math.min(N, 250000)
+local c2 = core.new_counter("memory")
+local prev, sorted, valid = nil, true, true
+for _ = 1, M do
+	local s = fmt(gen(c2), false)
+	if #s ~= 32 or s:sub(13, 13) ~= "7" then valid = false end
+	local var = tonumber(s:sub(17, 17), 16)          -- variant nibble must be 8..b (10xx)
+	if not (var and var >= 8 and var <= 11) then valid = false end
+	if prev and not (s > prev) then sorted = false end
+	prev = s
+end
+io.write(string.format("  check: sample of %d -> %s, %s\n", M,
+	sorted and "strictly increasing (unique + sorted)" or "NOT MONOTONIC",
+	valid and "all valid (ver=7, variant=10xx)" or "INVALID OUTPUT"))
+
+if sink == 0 then io.write("") end   -- keep `sink` live
+os.exit((sorted and valid) and 0 or 1)

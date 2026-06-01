@@ -1,0 +1,132 @@
+#!/usr/bin/env luajit
+-- The daemon dispenses from its in-memory counter; the plain CLI uses the separate
+-- fs/SysV counter. If the CLI silently generated locally while a daemon was running,
+-- the two independent streams could sort out of order -> the "strictly monotonic"
+-- guarantee would be violated. So: a REACHABLE daemon must serve every live request
+-- (with bounded, backed-off retries); the CLI must NEVER silently fall back to local
+-- generation when a daemon answered the socket. Local generation is only correct when
+-- NO daemon is reachable (the normal standalone CLI mode), or for static/explicit-time
+-- requests (intentionally reproducible, off the live stream).
+--
+-- Tests the decision layer (client.try_daemon) directly by stubbing the transport
+-- (client.oneshot) and injecting a fake sleep + deterministic jitter, so it is fast and
+-- deterministic and needs no real socket.
+
+local self_dir = (arg and arg[0] or ""):match("^(.*)/[^/]+$") or "."
+package.path = self_dir .. "/../lib/?.lua;" .. package.path
+local client = require("uuidv7_client")
+
+local tests, fails = 0, 0
+local function ok(name, cond, detail)
+	tests = tests + 1
+	if cond then io.write("\u{2713} " .. name .. "\n")
+	else io.stderr:write("\u{2717} " .. name .. (detail and (": " .. tostring(detail)) or "") .. "\n"); fails = fails + 1 end
+end
+
+-- Transport stub: yields the given responses in sequence; the last entry repeats. NIL
+-- is a sentinel for "oneshot returned nil" (connect failed) — a real nil can't sit in a
+-- table without breaking its length. `calls` counts invocations; `lines` records each
+-- request line oneshot was asked to send.
+local NIL = setmetatable({}, { __tostring = function() return "<nil>" end })
+local calls, lines
+local function stub(seq)
+	calls, lines = 0, {}
+	client.oneshot = function(_, line)
+		calls = calls + 1
+		lines[calls] = line
+		local v = seq[math.min(calls, #seq)]
+		if v == NIL then return nil end
+		if type(v) == "function" then return v() end
+		return v
+	end
+end
+
+-- A fake sleep that records the requested delays instead of waiting; rand=0 makes the
+-- 1.5x+jitter growth deterministic. Fast opts for all retry-exercising cases.
+local slept
+local function fastopts(extra)
+	slept = {}
+	local o = { sleep = function(us) slept[#slept + 1] = us end, rand = function() return 0 end }
+	for k, v in pairs(extra or {}) do o[k] = v end
+	return o
+end
+
+-- 1) No daemon reachable (connect fails -> oneshot returns nil): generate locally.
+stub({ NIL })
+local a = client.try_daemon({}, fastopts())
+ok("no daemon -> pass (local generation is correct)", a == "pass", a)
+
+-- 2) Daemon serves a uuid on the first try: emit it verbatim; no retry, no sleep.
+stub({ "017f22e279b077ffbfc90c9a45e78a47\n" })
+local a2, p2 = client.try_daemon({}, fastopts())
+ok("daemon serves -> emit", a2 == "emit" and p2 == "017f22e279b077ffbfc90c9a45e78a47\n", tostring(a2) .. "," .. tostring(p2))
+ok("first success: no retry telemetry, no sleep", lines[1] == "" and #slept == 0, tostring(lines[1]) .. " slept=" .. #slept)
+
+-- 3) Reachable but persistently empty: error after the attempt cap, never go local.
+stub({ "" })
+local a3, m3 = client.try_daemon({}, fastopts({ attempts = 3 }))
+ok("reachable+empty -> error (no silent fallback)", a3 == "error", a3)
+ok("honored attempt cap (3 tries)", calls == 3, "calls=" .. calls)
+ok("error names the attempts", m3:match("after 3 attempts") ~= nil, m3)
+
+-- 4) Reachable but returns ERR every time: error, never local.
+stub({ "ERR overloaded\n" })
+local a4, m4 = client.try_daemon({}, fastopts({ attempts = 2 }))
+ok("reachable+ERR -> error", a4 == "error", a4)
+ok("error surfaces last reply", m4:match("ERR overloaded") ~= nil, m4)
+
+-- 5) Transient hiccup then success: retry against the DAEMON, then emit (no local).
+stub({ "", "017f22e279b077ffbfc90c9a45e78a47\n" })
+local a5, p5 = client.try_daemon({}, fastopts())
+ok("transient empty then uuid -> emit", a5 == "emit" and p5:match("^017f22"), tostring(a5))
+ok("retry hit the daemon exactly once more", calls == 2, "calls=" .. calls)
+
+-- 5b) The retry carries telemetry: R<attempt> and W<microseconds waited so far>.
+ok("first request has no telemetry", lines[1] == "", tostring(lines[1]))
+ok("retry request sends R2 + waited W", lines[2] == "R2W50", tostring(lines[2]))
+
+-- 5c) Backoff starts real small (50us) and grows ~1.5x (jitter=0 here).
+stub({ "" })   -- always empty: force several backed-off retries
+client.try_daemon({}, fastopts({ attempts = 4 }))
+ok("backoff 1st delay is 50us", slept[1] == 50, tostring(slept[1]))
+ok("backoff grows ~1.5x (50,75,112)", slept[2] == 75 and slept[3] == 112, table.concat(slept, ","))
+
+-- 6) Daemon vanished mid-retry (open now fails -> nil): local generation is correct.
+stub({ "", NIL })
+local a6 = client.try_daemon({}, fastopts())
+ok("daemon vanished mid-retry -> pass", a6 == "pass", a6)
+
+-- 7) Static/explicit timestamp stays local regardless of any daemon.
+client.oneshot = function() error("oneshot must not be called for static requests") end
+local a7 = client.try_daemon({ "1645557742000524287" }, fastopts())
+ok("static timestamp -> pass (never touches daemon)", a7 == "pass", a7)
+
+-- 8) Unknown flag is left to the local CLI to handle/reject.
+local a8 = client.try_daemon({ "--bogus" }, fastopts())
+ok("unknown flag -> pass", a8 == "pass", a8)
+
+-- 9) UUIDV7_NO_DAEMON forces local generation.
+local real_getenv = os.getenv
+os.getenv = function(k) if k == "UUIDV7_NO_DAEMON" then return "1" end return real_getenv(k) end
+local a9 = client.try_daemon({}, fastopts())
+os.getenv = real_getenv
+ok("UUIDV7_NO_DAEMON -> pass", a9 == "pass", a9)
+
+-- 10) "Error instead of retry": attempts=1 -> one try, then error; no sleep, no retry.
+stub({ "" })
+local a10, m10 = client.try_daemon({}, fastopts({ attempts = 1 }))
+ok("attempts=1 -> error on first failure", a10 == "error" and calls == 1, tostring(a10) .. " calls=" .. calls)
+ok("no-retry: no backoff sleep happened", #slept == 0, "slept=" .. #slept)
+ok("no-retry message says retries disabled", m10:match("retries are disabled") ~= nil, m10)
+
+-- 11) Timeout: a tight wait budget errors with a message naming the exceeded timeout.
+stub({ "" })
+local a11, m11 = client.try_daemon({}, fastopts({ attempts = 99, timeout_us = 120 }))
+ok("tight timeout -> error", a11 == "error", a11)
+ok("error names the timeout (120us)", m11:match("120us retry timeout") ~= nil, m11)
+-- base 50 + next 75 = 125 > 120, so it stops before the 2nd sleep would overshoot.
+ok("stopped within the wait budget", calls <= 3, "calls=" .. calls)
+
+if fails > 0 then io.stderr:write(fails .. " of " .. tests .. " fallback tests failed!\n")
+else io.write("All " .. tests .. " fallback tests passed!\n") end
+os.exit(fails)

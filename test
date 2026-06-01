@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Run all uuidv7 test suites with this project's bin/ on PATH and lib/ on LUA_PATH.
+set -uo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PATH="$here/bin:$PATH"
+export LUA_PATH="$here/lib/?.lua;;"
+export UUIDV7_TEST_FILE="$here/tests/uuidv7_test"
+rc=0
+"$here/tests/uuidv7_json_test"   || rc=$?   # mini JSON writer (+ escaping)
+"$here/tests/uuidv7_test"        || rc=$?   # core generator
+"$here/tests/uuidv7_layout_test" || rc=$?   # RFC bit-layout contract
+"$here/tests/uuidv7_daemon_test" || rc=$?   # UDS daemon (black-box)
+"$here/tests/uuidv7_extract_test" || rc=$?   # timestamp extraction round-trip
+"$here/tests/uuidv7_fallback_test" || rc=$?   # daemon retry / no-silent-fallback policy
+"$here/tests/uuidv7_load_test"    || rc=$?   # concurrency invariants under load (no perf gating)
+"$here/tests/uuidv7_fuzz_test"    || rc=$?   # hostile/malformed protocol input (robustness)
+exit "$rc"

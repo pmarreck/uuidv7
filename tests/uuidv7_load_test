@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Load / concurrency test for the uuidv7 daemon. Hammers a real `uuidv7 --daemon`
+# with many parallel client processes and asserts the daemon's CORRECTNESS INVARIANTS
+# under contention. Gates on invariants only — throughput/latency belong in
+# bench/uuidv7_bench, and timing thresholds would make this flaky on loaded CI.
+#
+# Invariants proven (the daemon is single-threaded + monotonic by construction):
+#   1. Zero duplicates across every UUID minted (the counter never repeated).
+#   2. Each connection's stream is strictly ascending (monotonic emission order).
+#   3. The server's perspective matches the clients': uuids_served == total collected.
+#   4. No spurious retries under healthy load (server.retries == 0), and the daemon
+#      never crashed (empty stderr).
+#
+# Tunables (env): UUIDV7_LOAD_WORKERS (12), UUIDV7_LOAD_ROUNDS (3), UUIDV7_LOAD_BATCH (400).
+set -uo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PATH="$here/../bin:$PATH"
+export LUA_PATH="$here/../lib/?.lua;;"
+export UUIDV7_SILENCE_INSECURE_RANDOM=1
+
+WORKERS="${UUIDV7_LOAD_WORKERS:-12}"
+ROUNDS="${UUIDV7_LOAD_ROUNDS:-3}"
+BATCH="${UUIDV7_LOAD_BATCH:-400}"
+EXPECT=$(( WORKERS * ROUNDS * BATCH ))
+
+tests=0; fails=0
+assert() {  # name, "ok"|"fail", optional-detail
+	local name="$1" cond="$2" detail="${3:-}"
+	(( tests++ ))
+	if [[ "$cond" == "ok" ]]; then echo "✓ $name"
+	else echo "✗ $name${detail:+: $detail}" >&2; (( fails++ )); fi
+}
+
+run="$(mktemp -d)"
+sock="$run/d.sock"
+logf="$run/d.log"
+derr="$run/derr"
+trap 'env UUIDV7_SOCK="$sock" uuidv7 --api +++ >/dev/null 2>&1; rm-safe "$run" >/dev/null 2>&1 || true' EXIT
+
+# --- start the daemon; block (no sleep) on its readiness line via a coproc pipe.
+# The daemon only ever writes "UUIDV7-LISTENING" to stdout (logs go to the file), so
+# leaving the rest of its stdout unread never fills the buffer.
+coproc DAEMON { env UUIDV7_SOCK="$sock" UUIDV7_LOG="$logf" uuidv7 --daemon 2>"$derr"; }
+ready=fail
+while IFS= read -r line <&"${DAEMON[0]}"; do
+	[[ "$line" == UUIDV7-LISTENING* ]] && { ready=ok; break; }
+done
+assert "daemon announced listening" "$ready"
+
+api() { env UUIDV7_SOCK="$sock" uuidv7 --api "$1"; }
+stat() { api sj | grep -o "\"$1\":[0-9]*" | grep -o '[0-9]*'; }
+
+base_served=$(stat uuids_served)
+base_retries=$(stat retries)
+
+# --- fan out WORKERS parallel clients, each minting ROUNDS*BATCH compact UUIDs ---
+worker() {  # $1 = worker id; writes its UUIDs (in emission order) to $run/w$1
+	local id="$1" out="$run/w$1" r
+	: >"$out"
+	for (( r = 0; r < ROUNDS; r++ )); do
+		env UUIDV7_SOCK="$sock" uuidv7 --api "c$BATCH" >>"$out" || return 1
+	done
+}
+pids=()
+for (( w = 0; w < WORKERS; w++ )); do worker "$w" & pids+=($!); done
+wstatus=0
+for p in "${pids[@]}"; do wait "$p" || wstatus=1; done
+assert "all $WORKERS workers exited cleanly" "$([[ $wstatus -eq 0 ]] && echo ok || echo fail)"
+
+# --- aggregate & check invariants ---
+cat "$run"/w* >"$run/all"
+total=$(wc -l <"$run/all" | tr -d ' ')
+uniq=$(LC_ALL=C sort -u "$run/all" | wc -l | tr -d ' ')
+errlines=$(grep -E '^ERR' "$run/all" | wc -l | tr -d ' ')
+malformed=$(grep -vE '^[0-9a-f]{32}$' "$run/all" | wc -l | tr -d ' ')
+
+assert "minted the expected count ($EXPECT)" "$([[ $total -eq $EXPECT ]] && echo ok || echo fail)" "got $total"
+assert "no ERR replies under load"            "$([[ $errlines -eq 0 ]] && echo ok || echo fail)" "$errlines ERR lines"
+assert "every line is a 32-hex compact UUID"  "$([[ $malformed -eq 0 ]] && echo ok || echo fail)" "$malformed malformed"
+assert "ZERO duplicates across all workers"   "$([[ $uniq -eq $total ]] && echo ok || echo fail)" "$((total - uniq)) dupes"
+
+# Invariant 2: each worker's stream is strictly ascending. With global uniqueness
+# proven above, "sorted (non-decreasing)" + "all distinct" == strictly increasing.
+mono_ok=ok
+for (( w = 0; w < WORKERS; w++ )); do
+	LC_ALL=C sort -C "$run/w$w" || { mono_ok=fail; break; }
+done
+assert "each connection stream is strictly ascending" "$mono_ok"
+
+# Invariant 3 + 4: reconcile the server's perspective with the clients'.
+delta_served=$(( $(stat uuids_served) - base_served ))
+delta_retries=$(( $(stat retries) - base_retries ))
+assert "server uuids_served matches clients ($EXPECT)" "$([[ $delta_served -eq $EXPECT ]] && echo ok || echo fail)" "server +$delta_served"
+assert "no spurious client retries under healthy load" "$([[ $delta_retries -eq 0 ]] && echo ok || echo fail)" "server saw +$delta_retries retries"
+
+# Invariant 4: the daemon never crashed (no LuaJIT traceback on stderr).
+crashed=$(wc -c <"$derr" | tr -d ' ')
+assert "daemon stderr is clean (no crash)" "$([[ $crashed -eq 0 ]] && echo ok || echo fail)" "$(head -c 200 "$derr")"
+
+echo "---"
+echo "load: $WORKERS workers x $ROUNDS rounds x $BATCH = $EXPECT UUIDs, $uniq unique, server +$delta_served served"
+if (( fails > 0 )); then echo "$fails of $tests load assertions failed!" >&2; else echo "All $tests load assertions passed!"; fi
+exit "$fails"

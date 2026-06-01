@@ -1,0 +1,71 @@
+#!/usr/bin/env luajit
+-- Tests for the mini JSON encoder, with emphasis on escaping / injection-resistance.
+
+local self_dir = (arg and arg[0] or ""):match("^(.*)/[^/]+$") or "."
+package.path = self_dir .. "/../lib/?.lua;" .. package.path
+local json = require("uuidv7_json")
+
+local tests, fails = 0, 0
+local function eq(name, got, want)
+	tests = tests + 1
+	if got == want then
+		io.write("\u{2713} " .. name .. "\n")
+	else
+		io.stderr:write("\u{2717} " .. name .. ": got [" .. tostring(got) .. "] want [" .. tostring(want) .. "]\n")
+		fails = fails + 1
+	end
+end
+
+-- scalars
+eq("integer", json.encode(5), "5")
+eq("negative", json.encode(-3), "-3")
+eq("zero", json.encode(0), "0")
+eq("float", json.encode(1.5), "1.5")
+eq("large int (ts_ms)", json.encode(1780413845000), "1780413845000")
+eq("true", json.encode(true), "true")
+eq("false", json.encode(false), "false")
+eq("nil", json.encode(nil), "null")
+eq("nan -> null", json.encode(0/0), "null")
+eq("inf -> null", json.encode(1/0), "null")
+
+-- strings & escaping
+eq("plain string", json.encode("hi"), '"hi"')
+eq("empty string", json.encode(""), '""')
+eq("quote", json.encode('a"b'), '"a\\"b"')
+eq("backslash", json.encode('a\\b'), '"a\\\\b"')
+eq("newline", json.encode("a\nb"), '"a\\nb"')
+eq("tab", json.encode("a\tb"), '"a\\tb"')
+eq("carriage return", json.encode("a\rb"), '"a\\rb"')
+eq("control 0x01", json.encode("\1"), '"\\u0001"')
+eq("null byte 0x00", json.encode("\0"), '"\\u0000"')
+eq("DEL 0x7f", json.encode("\127"), '"\\u007f"')
+eq("high byte 0xc3", json.encode("\195"), '"\\u00c3"')
+
+-- injection resistance: an embedded newline + forged object stays ONE escaped string
+do
+	local evil = 'c5\n{"event":"forged"}'
+	local out = json.encode(evil)
+	eq("no raw newline in output", out:find("\n", 1, true) == nil, true)
+	eq("forged braces are inside the string", out, '"c5\\n{\\"event\\":\\"forged\\"}"')
+end
+
+-- arrays
+eq("array", json.encode({10, 20, 30}), "[10,20,30]")
+eq("empty table -> object", json.encode({}), "{}")
+eq("string array", json.encode({"a", "b"}), '["a","b"]')
+
+-- objects (keys sorted for determinism)
+eq("object sorted keys", json.encode({b = 2, a = 1}), '{"a":1,"b":2}')
+eq("mixed object", json.encode({event = "error", n = 5, request = 'c"x'}),
+	'{"event":"error","n":5,"request":"c\\"x"}')
+
+-- a realistic log line shape
+eq("log line", json.encode({v = 1, event = "start", ts_ms = 1780413845000, pid = 123}),
+	'{"event":"start","pid":123,"ts_ms":1780413845000,"v":1}')
+
+if fails > 0 then
+	io.stderr:write(fails .. " of " .. tests .. " JSON tests failed!\n")
+	os.exit(1)
+else
+	io.write("All " .. tests .. " JSON tests passed!\n")
+end

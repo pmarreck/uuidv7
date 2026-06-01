@@ -1,0 +1,174 @@
+#!/usr/bin/env luajit
+
+-- Generation lives in the shared core (single source of truth for the bit layout).
+-- LuaJIT seeds package.path from $LUA_PATH; add fallbacks for repo + installed use.
+local _self = (arg and arg[0] or ""):match("^(.*)/[^/]+$") or "."
+package.path = table.concat({
+	_self .. "/?.lua",
+	_self .. "/../lib/?.lua",
+	(os.getenv("HOME") or "") .. "/Documents-CloudManaged/uuidv7/lib/?.lua",
+	package.path,
+}, ";")
+local core = require("uuidv7_core")
+local counter = core.new_counter("auto")
+local parse_static = core.parse_static
+local format_uuid = core.format_uuid
+local function generate_uuidv7(static_nanotime)
+	return (core.generate_bytes(counter, static_nanotime))
+end
+
+-- Show help
+local function show_help()
+	print([[
+uuidv7 - Generate RFC 9562 compliant UUIDv7 (time-ordered, strictly monotonic)
+
+Usage: uuidv7 [options] [nanoseconds-from-epoch]
+       uuidv7 --daemon
+
+Options:
+  --hyphen, --hyphens, -      Output with hyphens
+  -h, --help                  Show this help message
+  --about, -a                 Show a brief description
+  --test                      Run the test suite
+  --daemon                    Run as a Unix-socket daemon (see below)
+  --api, --raw, --socket-api  Send a raw protocol line to a running daemon, print reply
+                              e.g. uuidv7 --api c5  (5 uuids)   uuidv7 --api s  (status)
+  --extract-timestamp <uuid>  Recover the epoch timestamp encoded in a UUIDv7
+  --extract-timestamp-ms <uuid>   ... as unix milliseconds (default)
+  --extract-timestamp-ns <uuid>   ... as unix nanoseconds (sub-ms precision)
+                              Accepts hyphenated or compact, any capitalization.
+                              -ns warns (sub-ms bits are only meaningful for UUIDs
+                              from this tool); mute with --mute-warning or
+                              UUIDV7_NS_EXTRACT_OK=1.
+
+Arguments:
+  nanoseconds-from-epoch      Optional static timestamp (testing/backfill)
+
+Daemon:
+  `uuidv7 --daemon` serves UUIDv7s over a Unix socket
+  (${XDG_RUNTIME_DIR:-$TMPDIR}/uuidv7.sock, mode 0600). The plain CLI
+  transparently uses a running daemon for live generation. Send raw
+  protocol lines to the socket, e.g.:
+    echo 'c5' | nc -U "${XDG_RUNTIME_DIR:-$TMPDIR}/uuidv7.sock"
+  Protocol (newline-terminated, no spaces; tokens in any order):
+    <empty> one compact    c<N> N uuids    - hyphenated
+    tn<ns> / tm<ms> explicit time    * ephemeral (requires tn/tm)
+    R<n> / W<us> client retry telemetry (attempt #, microseconds waited; logged)
+    PING  s=status  sj=status(JSON)  l=log-stats  r=restart  +++=shutdown  h or ?
+  When a daemon is reachable the CLI gets its UUID from it and NEVER silently
+  generates locally (that uses a separate counter and could break monotonicity):
+  it retries with tiny exponential backoff, then errors. Tune/disable via env.
+  Env: UUIDV7_SOCK, UUIDV7_MAX_BATCH(=1000), UUIDV7_SILENCE_INSECURE_RANDOM,
+       UUIDV7_LOG / XDG_STATE_HOME (JSONL log location), UUIDV7_NS_EXTRACT_OK,
+       UUIDV7_DAEMON_RETRIES(=20), UUIDV7_DAEMON_RETRY_TIMEOUT_US(=2000),
+       UUIDV7_DAEMON_NO_RETRY (error instead of retry).
+
+Examples:
+  uuidv7                      Generate UUID without hyphens
+  uuidv7 --hyphen             Generate UUID with hyphens
+  uuidv7 1234567890123456789  Generate UUID with a static timestamp
+]])
+end
+
+-- Main
+local function main(args)
+	if args[1] == "--daemon" then
+		require("uuidv7_daemon").run({ arg0 = arg and arg[0] })
+		return
+	end
+	if args[1] == "--api" or args[1] == "--raw" or args[1] == "--socket-api" then
+		-- send a raw protocol line to the running daemon and print its reply
+		local cl = require("uuidv7_client")
+		local resp, cerr = cl.oneshot(nil, args[2] or "")
+		if not resp then
+			io.stderr:write("uuidv7: no daemon reachable at " .. cl.default_path() .. " (" .. tostring(cerr) .. ")\n")
+			os.exit(1)
+		end
+		io.write(resp)
+		return
+	end
+
+	-- Recover the original epoch timestamp from a UUIDv7 (no daemon needed).
+	if args[1] == "--extract-timestamp" or args[1] == "--extract-timestamp-ms"
+		or args[1] == "--extract-timestamp-ns" then
+		local unit = (args[1] == "--extract-timestamp-ns") and "ns" or "ms"
+		-- The uuid is the first non-flag operand; --mute-warning may appear anywhere.
+		local uuid_arg, muted = nil, false
+		for i = 2, #args do
+			if args[i] == "--mute-warning" then muted = true
+			elseif uuid_arg == nil then uuid_arg = args[i] end
+		end
+		local val, eerr = core.extract_timestamp(uuid_arg or "", unit)
+		if not val then
+			io.stderr:write("uuidv7: " .. tostring(eerr) .. "\n")
+			os.exit(1)
+		end
+		-- The sub-ms nanosecond bits are only meaningful for UUIDs this tool made;
+		-- a foreign RFC 9562 v7 carries random bits there. Warn unless muted.
+		if unit == "ns" and not muted then
+			local ok = (os.getenv("UUIDV7_NS_EXTRACT_OK") or ""):lower()
+			if ok ~= "1" and ok ~= "true" then
+				io.stderr:write("\27[31muuidv7 WARNING: nanosecond extraction is only meaningful for " ..
+					"UUIDv7s generated by this tool; other RFC 9562 v7 UUIDs have random sub-millisecond " ..
+					"bits, so the ns value below is unreliable for them. The millisecond field is always " ..
+					"valid. Pass --mute-warning or set UUIDV7_NS_EXTRACT_OK=1 to mute this.\27[0m\n")
+			end
+		end
+		print(val)
+		return
+	end
+	do  -- fast path: a running daemon handles LIVE generation transparently
+		local ok, client = pcall(require, "uuidv7_client")
+		if ok and client.maybe_handle(args) then return end
+	end
+	if #args == 0 then
+		-- Generate UUID without hyphens
+		local uuid = generate_uuidv7()
+		print(format_uuid(uuid, false))
+		return
+	end
+	
+	local arg1 = args[1]
+	local arg2 = args[2]
+	
+	-- Parse static timestamp if provided (last argument that's a number)
+	local static_nanotime = nil
+	local last_arg = args[#args]
+	if last_arg and parse_static(last_arg) then
+		static_nanotime = parse_static(last_arg)
+	end
+	
+	if arg1 == "-h" or arg1 == "--help" then
+		show_help()
+	elseif arg1 == "--about" or arg1 == "-a" then
+		print("Generate RFC 9562 compliant UUIDv7 with nanosecond precision")
+	elseif arg1 == "--test" then
+		local self = (arg and arg[0]) or ""
+		local self_dir = self:match("^(.*)/[^/]+$")
+		local candidates = {}
+		if os.getenv("UUIDV7_TEST_FILE") then candidates[#candidates+1] = os.getenv("UUIDV7_TEST_FILE") end
+		if self_dir then candidates[#candidates+1] = self_dir .. "/../tests/uuidv7_test"; candidates[#candidates+1] = self_dir .. "/tests/uuidv7_test" end
+		candidates[#candidates+1] = (os.getenv("HOME") or "") .. "/Documents-CloudManaged/uuidv7/tests/uuidv7_test"
+		candidates[#candidates+1] = (os.getenv("HOME") or "") .. "/dotfiles/bin/test/uuidv7_test"
+		local found
+		for _, p in ipairs(candidates) do local fh = io.open(p, "r"); if fh then fh:close(); found = p; break end end
+		if found then os.execute("exec " .. found) else io.stderr:write("uuidv7 test file not found\n"); os.exit(1) end
+	elseif arg1 == "--hyphen" or arg1 == "--hyphens" or arg1 == "-" then
+		local uuid = generate_uuidv7(static_nanotime)
+		print(format_uuid(uuid, true))
+	elseif parse_static(arg1) then
+		-- First argument is a number, treat as static timestamp
+		local uuid = generate_uuidv7(parse_static(arg1))
+		print(format_uuid(uuid, false))
+	else
+		-- Unrecognized argument: fail loudly rather than silently generating.
+		io.stderr:write("uuidv7: unknown option '" .. tostring(arg1) .. "'\n" ..
+			"Try 'uuidv7 --help' for usage.\n")
+		os.exit(1)
+	end
+end
+
+-- Run if executed directly
+if arg then
+	main(arg)
+end

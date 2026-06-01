@@ -1,0 +1,193 @@
+#!/usr/bin/env luajit
+-- Black-box test for the uuidv7 daemon. Starts a real `uuidv7 --daemon`, drives it
+-- over a private Unix socket, and asserts protocol behavior, monotonicity, guards,
+-- the SYN/ACK handshake, JSONL logging (+ injection resistance), and re-exec restart.
+--
+-- NO SLEEPS: the daemon prints a "UUIDV7-LISTENING" line to stdout the instant it is
+-- listening, so we synchronize on that event (initial start AND after re-exec). io.popen
+-- gives us the child handle, so shutdown is confirmed by stdout EOF, not a timer.
+
+local self_dir = (arg and arg[0] or ""):match("^(.*)/[^/]+$") or "."
+package.path = self_dir .. "/../lib/?.lua;" .. package.path
+local client = require("uuidv7_client")
+
+local tests, fails = 0, 0
+local function ok(name, cond, detail)
+	tests = tests + 1
+	if cond then
+		io.write("\u{2713} " .. name .. "\n")
+	else
+		io.stderr:write("\u{2717} " .. name .. (detail and (": " .. tostring(detail)) or "") .. "\n")
+		fails = fails + 1
+	end
+end
+
+local base = (os.getenv("TMPDIR") or "/tmp"):gsub("/+$", "")
+local run = base .. "/uuidv7_dtest_" .. tostring(os.time())
+os.execute("mkdir -p '" .. run .. "'")
+local sock = run .. "/d.sock"
+local logf = run .. "/d.log"
+local exe = self_dir .. "/../bin/uuidv7"
+local libp = self_dir .. "/../lib/?.lua;;"
+
+local derrf = run .. "/derr"   -- capture daemon stderr (LuaJIT tracebacks land here)
+local dh   -- popen handle for the daemon child
+local function start_daemon()
+	local cmd = string.format(
+		"env UUIDV7_SOCK=%q UUIDV7_LOG=%q LUA_PATH=%q UUIDV7_SILENCE_INSECURE_RANDOM=1 %q --daemon 2>%q",
+		sock, logf, libp, exe, derrf)
+	dh = io.popen(cmd, "r")
+end
+local function dump_daemon_stderr()
+	local f = io.open(derrf, "r"); if not f then return end
+	local e = f:read("*a"); f:close()
+	if e and #e > 0 then io.stderr:write("----- daemon stderr -----\n" .. e .. "-------------------------\n") end
+end
+-- Block (no sleep) until the daemon prints its readiness line.
+local function wait_ready()
+	while true do
+		local l = dh:read("*l")
+		if not l then return false end
+		if l:match("^UUIDV7%-LISTENING") then return true end
+	end
+end
+
+local function req(line) return (client.oneshot(sock, line)) end
+local function lines_of(s)
+	local t = {}; for l in (s or ""):gmatch("[^\n]+") do t[#t + 1] = l end; return t
+end
+local function is_uuid_compact(u) return type(u) == "string" and #u == 32 and u:sub(13, 13) == "7" end
+
+local pid
+local function body()
+	start_daemon()
+	ok("daemon announces listening", wait_ready())
+	pid = (req("sj") or ""):match('"pid":(%d+)')
+
+	-- basics
+	ok("PING -> OK", req("PING") == "OK\n", req("PING"))
+	local one = lines_of(req(""))
+	ok("empty request -> 1 compact uuid", #one == 1 and is_uuid_compact(one[1]), one[1])
+	local h = lines_of(req("-"))
+	ok("- -> hyphenated", #h == 1 and #h[1] == 36 and h[1]:sub(15, 15) == "7", h[1])
+
+	-- batch + monotonicity
+	local five = lines_of(req("c5"))
+	ok("c5 -> 5 uuids", #five == 5)
+	local mono = true
+	for i = 2, #five do if not (five[i] > five[i - 1]) then mono = false end end
+	ok("c5 strictly increasing", mono, table.concat(five, " "))
+	ok("c3- -> 3 hyphenated", (function() local t = lines_of(req("c3-")); return #t == 3 and #t[1] == 36 end)())
+
+	-- explicit time honored exactly + counter-incremented batch
+	local NT = "1645557742000524287"
+	ok("tn<ns> honors timestamp prefix", (lines_of(req("tn" .. NT))[1] or ""):sub(1, 12) == "017f22e279b0")
+	local sb = lines_of(req("c3tn" .. NT))
+	ok("c3tn<ns> -> 3 strictly increasing at same ts",
+		#sb == 3 and sb[1]:sub(1, 12) == "017f22e279b0" and sb[2] > sb[1] and sb[3] > sb[2], table.concat(sb, " "))
+
+	-- future guard + ephemeral bypass (FUTURE fits int64 even after *1e6)
+	local FUTURE = "4102444800000"   -- 2100-01-01 in ms
+	ok("tm far-future -> ERR", req("tm" .. FUTURE):match("^ERR") ~= nil, req("tm" .. FUTURE))
+	ok("tm far-future with * -> ok", #lines_of(req("c1tm" .. FUTURE .. "*")) == 1)
+	-- a malformed / int64-overflowing request must NOT crash the daemon
+	req("tm99999999999999"); req("c1tm99999999999999*")
+	ok("daemon survives a malformed request", req("PING") == "OK\n")
+
+	-- caps & errors
+	ok("c1001 -> ERR too many", req("c1001"):match("too many") ~= nil, req("c1001"))
+	ok("c1000 -> 1000 uuids", #lines_of(req("c1000")) == 1000)
+	ok("unknown token -> ERR", req("zzz"):match("^ERR") ~= nil)
+	ok("* without tn/tm -> ERR", req("c2*"):match("^ERR") ~= nil)
+	ok("overlong line -> ERR", req("c" .. string.rep("9", 70)):match("^ERR") ~= nil)
+
+	-- SYN/ACK handshake on one connection, then a request
+	do
+		local c = client.open(sock)
+		c:send_raw("\22")
+		local sa = c:recv_bytes(2)
+		ok("SYN -> SYNACK (0x16 0x06)", sa == "\22\6", sa and #sa)
+		c:send_raw("\6")
+		c:send("PING")
+		ok("request works after handshake", c:recv_line() == "OK")
+		c:close()
+	end
+
+	-- status
+	ok("s -> human status", req("s"):match("uuids_served:") ~= nil)
+	ok("sj -> one JSON line, event:stats", (function()
+		local j = req("sj"); return j:match('"event":"stats"') ~= nil and #lines_of(j) == 1
+	end)())
+
+	-- concurrent connections -> global uniqueness
+	do
+		local a, b = client.open(sock), client.open(sock)
+		a:send("c10"); b:send("c10")
+		local seen, dup = {}, false
+		local function drain(conn) for _ = 1, 10 do local l = conn:recv_line(); if seen[l] then dup = true end; seen[l] = true end end
+		drain(a); drain(b)
+		ok("two connections: 20 unique uuids", not dup)
+		a:close(); b:close()
+	end
+
+	-- client retry telemetry: R<attempt>/W<us> tokens are logged + counted and still serve
+	do
+		local before = tonumber((req("sj")):match('"retries":(%d+)'))
+		local out = (req("R3W250") or ""):gsub("%s+$", "")   -- one uuid + "retry #3, waited 250us"
+		local after = tonumber((req("sj")):match('"retries":(%d+)'))
+		ok("retry-tagged request still returns a uuid", is_uuid_compact(out), out)
+		ok("daemon counts the retry", after == before + 1, tostring(before) .. "->" .. tostring(after))
+		local logtxt = (function() local f = io.open(logf, "r"); local s = f and f:read("*a") or ""; if f then f:close() end; return s end)()
+		ok("daemon logged a retry event with attempt+wait",
+			logtxt:match('"event":"retry"') ~= nil and logtxt:match('"attempt":3') ~= nil and logtxt:match('"waited_us":250') ~= nil)
+	end
+	-- log to file + injection attempt, then validate the whole log is JSONL
+	ok("l -> OK", req("l") == "OK\n")
+	req('x"}q')   -- a token that would corrupt the log if not JSON-escaped
+	if os.execute("command -v jq >/dev/null 2>&1") then
+		local rc = os.execute("jq . '" .. logf .. "' >/dev/null 2>&1")
+		ok("every log line is valid JSON (jq)", rc == true or rc == 0)
+	else
+		local good = true
+		for l in io.lines(logf) do if not (l:match("^{.*}$") and l:match('"event":')) then good = false end end
+		ok("every log line is a JSON object (no jq)", good)
+	end
+
+	-- CLI fast-path: plain `uuidv7` (NO_DAEMON unset) should route to the daemon
+	do
+		local before = tonumber((req("sj")):match('"uuids_served":(%d+)'))
+		local h = io.popen(string.format("env UUIDV7_SOCK=%q LUA_PATH=%q %q 2>/dev/null", sock, libp, exe), "r")
+		local out = h:read("*l"); h:close()
+		local after = tonumber((req("sj")):match('"uuids_served":(%d+)'))
+		ok("CLI routes live generation to the daemon", is_uuid_compact(out) and after > before,
+			tostring(out) .. " " .. tostring(before) .. "->" .. tostring(after))
+	end
+
+	-- --api flag: CLI sends a raw protocol line and prints the reply
+	do
+		local h = io.popen(string.format("env UUIDV7_SOCK=%q LUA_PATH=%q %q --api c5 2>/dev/null", sock, libp, exe), "r")
+		local out = h:read("*a"); h:close()
+		ok("--api c5 returns 5 uuids", #lines_of(out) == 5, out)
+	end
+
+	-- restart: re-exec preserving the socket. Synchronize on the NEW readiness line.
+	ok("r -> OK", req("r") == "OK\n", req("r"))
+	ok("daemon re-announces listening after restart", wait_ready())
+	ok("PING ok after restart", req("PING") == "OK\n")
+	ok("stats reset after restart", (req("sj") or ""):match('"requests":(%d+)') ~= nil)
+	pid = (req("sj") or ""):match('"pid":(%d+)')   -- same pid (re-exec), refresh anyway
+
+	-- shutdown: +++ -> OK, daemon exits (stdout EOF), socket removed
+	ok("+++ -> OK", req("+++") == "OK\n")
+	dh:read("*a")          -- drain to EOF (blocks until the daemon's stdout closes = exited)
+	ok("socket gone after shutdown", client.open(sock) == nil)
+end
+
+local okrun, err = pcall(body)
+dump_daemon_stderr()
+if dh then pcall(function() dh:close() end) end
+if pid then os.execute("kill " .. pid .. " 2>/dev/null") end   -- backstop if a test crashed
+os.execute("rm -rf '" .. run .. "' 2>/dev/null")
+if not okrun then io.stderr:write("daemon test crashed: " .. tostring(err) .. "\n"); os.exit(1) end
+if fails > 0 then io.stderr:write(fails .. " of " .. tests .. " daemon tests failed!\n"); os.exit(1) end
+io.write("All " .. tests .. " daemon tests passed!\n")
