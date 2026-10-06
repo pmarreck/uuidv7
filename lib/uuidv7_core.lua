@@ -103,33 +103,41 @@ local function parse_static(s)
 end
 M.parse_static = parse_static
 
-local function random_counter_init()
+-- 64 big-endian bits from the OS CSPRNG; the default counter-seed source.
+local function os_random_u64()
 	local b = get_random_bytes(8)
 	local v = 0ULL
 	for i = 0, 7 do v = bit.bor(bit.lshift(v, 8), ffi.cast("uint64_t", b[i])) end
-	return bit.band(v, COUNTER_INIT_MASK)
+	return v
+end
+M.os_random_u64 = os_random_u64
+
+local function random_counter_init(random_u64)
+	return bit.band(ffi.cast("uint64_t", (random_u64 or os_random_u64)()), COUNTER_INIT_MASK)
 end
 
 -- Pure state transition. Returns (effective_nanotime:int64, counter:uint64, kind:string).
 -- kind in {"new","same_ns","rollback","ts_ahead"} for stats.
-local function advance(stored_nt, stored_ctr, current_nt, is_static)
+-- random_u64 (optional) supplies counter seeds; it defaults to the OS CSPRNG and is
+-- injectable so tests and the differential oracle can fix the seed sequence.
+local function advance(stored_nt, stored_ctr, current_nt, is_static, random_u64)
 	if is_static then
 		if stored_nt ~= nil and stored_nt == current_nt then
 			local ctr = bit.band(stored_ctr + 1ULL, COUNTER_MASK)
-			if ctr == 0ULL then ctr = random_counter_init() end
+			if ctr == 0ULL then ctr = random_counter_init(random_u64) end
 			return current_nt, ctr, "same_ns"
 		end
-		return current_nt, random_counter_init(), "new"
+		return current_nt, random_counter_init(random_u64), "new"
 	end
 	if stored_nt == nil or current_nt > stored_nt then
-		return current_nt, random_counter_init(), "new"
+		return current_nt, random_counter_init(random_u64), "new"
 	end
 	local kind = (current_nt == stored_nt) and "same_ns" or "rollback"
 	local eff = stored_nt
 	local ctr = bit.band(stored_ctr + 1ULL, COUNTER_MASK)
 	if ctr == 0ULL then
 		eff = stored_nt + 1LL
-		ctr = random_counter_init()
+		ctr = random_counter_init(random_u64)
 		kind = "ts_ahead"
 	end
 	return eff, ctr, kind
@@ -142,8 +150,8 @@ M.advance = advance
 local MemoryCounter = {}
 MemoryCounter.__index = MemoryCounter
 function MemoryCounter:new() return setmetatable({ _nt = nil, _ctr = nil }, self) end
-function MemoryCounter:get_next(current_nt, is_static)
-	local eff, ctr, kind = advance(self._nt, self._ctr, current_nt, is_static)
+function MemoryCounter:get_next(current_nt, is_static, random_u64)
+	local eff, ctr, kind = advance(self._nt, self._ctr, current_nt, is_static, random_u64)
 	self._nt, self._ctr = eff, ctr
 	return eff, ctr, kind
 end
@@ -155,10 +163,10 @@ function FsCounter:new()
 	local tmp = (os.getenv("TMPDIR") or "/tmp"):gsub("/+$", "")
 	return setmetatable({ filepath = tmp .. "/uuidv7-sequence", _nt = nil, _ctr = nil }, self)
 end
-function FsCounter:get_next(current_nt, is_static)
+function FsCounter:get_next(current_nt, is_static, random_u64)
 	local fd = C.open(self.filepath, bit.bor(C.O_CREAT, C.O_RDWR), ffi.new("int", 438))
 	if fd < 0 then
-		self._nt, self._ctr = advance(self._nt, self._ctr, current_nt, is_static)
+		self._nt, self._ctr = advance(self._nt, self._ctr, current_nt, is_static, random_u64)
 		return self._nt, self._ctr, "new"
 	end
 	C.flock(fd, C.LOCK_EX)
@@ -173,7 +181,7 @@ function FsCounter:get_next(current_nt, is_static)
 			stored_ctr = ffi.cast("uint64_t", C.strtoll(s_ctr, nil, 10))
 		end
 	end
-	local eff, ctr, kind = advance(stored_nt, stored_ctr, current_nt, is_static)
+	local eff, ctr, kind = advance(stored_nt, stored_ctr, current_nt, is_static, random_u64)
 	local out = num_to_dec(eff) .. ":" .. num_to_dec(ctr)
 	C.lseek(fd, 0, C.SEEK_SET)
 	C.ftruncate(fd, 0)
@@ -187,22 +195,22 @@ end
 local SysVCounter = {}
 SysVCounter.__index = SysVCounter
 function SysVCounter:new() return setmetatable({ key = 0x75756964, _nt = nil, _ctr = nil }, self) end
-function SysVCounter:get_next(current_nt, is_static)
+function SysVCounter:get_next(current_nt, is_static, random_u64)
 	local shmid = C.shmget(self.key, 16, bit.bor(C.IPC_CREAT, 438))
 	if shmid == -1 then
-		self._nt, self._ctr = advance(self._nt, self._ctr, current_nt, is_static)
+		self._nt, self._ctr = advance(self._nt, self._ctr, current_nt, is_static, random_u64)
 		return self._nt, self._ctr, "new"
 	end
 	local ptr = C.shmat(shmid, nil, 0)
 	if ffi.cast("intptr_t", ptr) == ffi.cast("intptr_t", -1) then
-		self._nt, self._ctr = advance(self._nt, self._ctr, current_nt, is_static)
+		self._nt, self._ctr = advance(self._nt, self._ctr, current_nt, is_static, random_u64)
 		return self._nt, self._ctr, "new"
 	end
 	local nt_ptr = ffi.cast("int64_t*", ptr)
 	local ctr_ptr = ffi.cast("uint64_t*", ffi.cast("char*", ptr) + 8)
 	local stored_nt, stored_ctr
 	if nt_ptr[0] ~= 0LL then stored_nt = nt_ptr[0]; stored_ctr = ctr_ptr[0] end
-	local eff, ctr, kind = advance(stored_nt, stored_ctr, current_nt, is_static)
+	local eff, ctr, kind = advance(stored_nt, stored_ctr, current_nt, is_static, random_u64)
 	nt_ptr[0] = eff
 	ctr_ptr[0] = ctr
 	C.shmdt(ptr)
@@ -220,11 +228,11 @@ function M.new_counter(backend)
 	error("uuidv7_core: unknown counter backend " .. tostring(backend))
 end
 
--- Build the 16 UUID bytes for one value. Returns (bytes, kind).
-local function generate_bytes(counter, static_nanotime)
-	local is_static = static_nanotime ~= nil
-	local current = static_nanotime or get_nanotime()
-	local eff, ctr, kind = counter:get_next(current, is_static)
+-- Pure RFC 9562 layout: 16 bytes (1-indexed table) from an effective epoch
+-- nanosecond and a 54-bit counter. 48-bit unix_ts_ms, version 7, the 20-bit
+-- sub-millisecond nanosecond split across rand_a (12) and rand_b (8), variant 10,
+-- then the counter in the low 54 bits of rand_b.
+local function encode_bytes(eff, ctr)
 	local ms = ffi.cast("uint64_t", eff / NS_PER_MS)
 	local ns = tonumber(eff % NS_PER_MS)
 	local ns_hi12 = bit.band(bit.rshift(ns, 8), 0xFFF)
@@ -247,9 +255,35 @@ local function generate_bytes(counter, static_nanotime)
 	u[14] = tonumber(bit.band(bit.rshift(rand_b, 16), 0xFF))
 	u[15] = tonumber(bit.band(bit.rshift(rand_b, 8), 0xFF))
 	u[16] = tonumber(bit.band(rand_b, 0xFF))
-	return u, kind
+	return u
+end
+M.encode_bytes = encode_bytes
+
+-- Build the 16 UUID bytes for one value. Returns (bytes, kind).
+local function generate_bytes(counter, static_nanotime, clock, random_u64)
+	local is_static = static_nanotime ~= nil
+	local current = static_nanotime or (clock or get_nanotime)()
+	local eff, ctr, kind = counter:get_next(current, is_static, random_u64)
+	return encode_bytes(eff, ctr), kind
 end
 M.generate_bytes = generate_bytes
+
+-- A generator with injectable clock (returns int64 epoch ns), counter-seed source
+-- and counter backend. Defaults match the CLI; injection exists for deterministic
+-- coarse-clock and differential tests.
+local Generator = {}
+Generator.__index = Generator
+function M.new_generator(opts)
+	opts = opts or {}
+	return setmetatable({
+		clock = opts.clock or get_nanotime,
+		random_u64 = opts.random_u64,
+		counter = opts.counter or M.new_counter("auto"),
+	}, Generator)
+end
+function Generator:next_bytes(static_nanotime)
+	return generate_bytes(self.counter, static_nanotime, self.clock, self.random_u64)
+end
 
 local function format_uuid(b, with_hyphens)
 	local hex = {}

@@ -1,0 +1,116 @@
+#!/usr/bin/env luajit
+-- Injected-clock tests: strict monotonicity and uniqueness when the clock is coarse
+-- (1 ms, 100 ns ticks as on Windows) or steps backward. Clock and randomness are
+-- injected so every run is deterministic; no real time or OS entropy is read.
+
+local self_dir = (arg and arg[0] or ""):match("^(.*)/[^/]+$") or "."
+package.path = self_dir .. "/../lib/?.lua;" .. package.path
+local ffi = require("ffi")
+local bit = require("bit")
+local core = require("uuidv7_core")
+
+local tests, fails = 0, 0
+local function ok(name, cond, detail)
+	tests = tests + 1
+	if cond then
+		io.write("\u{2713} " .. name .. "\n")
+	else
+		io.stderr:write("\u{2717} " .. name .. (detail and (": " .. detail) or "") .. "\n")
+		fails = fails + 1
+	end
+end
+
+-- Deterministic 64-bit xorshift so the injected "randomness" is reproducible.
+local function xorshift64(seed)
+	local s = ffi.new("uint64_t[1]", seed)
+	return function()
+		local x = s[0]
+		x = bit.bxor(x, bit.lshift(x, 13))
+		x = bit.bxor(x, bit.rshift(x, 7))
+		x = bit.bxor(x, bit.lshift(x, 17))
+		s[0] = x
+		return x
+	end
+end
+
+-- A fake wall clock: true time advances by `step_ns` per read, is quantized down
+-- to `tick_ns`, and at each index listed in `jumps` moves by that many ns
+-- (negative = the clock steps backward).
+local function fake_clock(start_ns, step_ns, tick_ns, jumps)
+	local t = ffi.new("int64_t[1]", start_ns)
+	local reads = 0
+	return function()
+		reads = reads + 1
+		t[0] = t[0] + step_ns
+		local j = jumps and jumps[reads]
+		if j then t[0] = t[0] + j end
+		return t[0] - (t[0] % tick_ns)
+	end
+end
+
+-- Generate n UUIDs from an injected clock; return the first ordering violation.
+local function check_sequence(n, clock, rand)
+	local gen = core.new_generator({ clock = clock, random_u64 = rand, counter = core.new_counter("memory") })
+	local prev = nil
+	local seen = {}
+	for i = 1, n do
+		local s = core.format_uuid((gen:next_bytes()), false)
+		if seen[s] then return false, "duplicate at #" .. i .. ": " .. s end
+		seen[s] = true
+		if prev and not (s > prev) then
+			return false, "not strictly increasing at #" .. i .. ": " .. prev .. " then " .. s
+		end
+		prev = s
+	end
+	return true
+end
+
+local START = 1700000000000000000LL  -- 2023-11-14, nanoseconds since epoch
+local N = 60000
+
+-- Backward steps: a small one-tick slip, a 5 ms NTP-style step, a 2 s step.
+local jumps = { [1000] = -100, [20000] = -5000000, [40000] = -2000000000 }
+
+for _, case in ipairs({
+	{ name = "1 ms ticks",   tick = 1000000LL },
+	{ name = "100 ns ticks", tick = 100LL },
+	{ name = "1 ns ticks",   tick = 1LL },
+}) do
+	ok(case.name .. ": strictly increasing + unique (steady clock)",
+		check_sequence(N, fake_clock(START, 37LL, case.tick), xorshift64(0x9E3779B97F4A7C15ULL)))
+	local good, detail = check_sequence(N, fake_clock(START, 37LL, case.tick, jumps), xorshift64(0xD1B54A32D192ED03ULL))
+	ok(case.name .. ": strictly increasing + unique (clock steps backward)", good, detail)
+end
+
+-- A frozen clock (every read identical) must still yield strictly increasing values.
+ok("frozen clock: strictly increasing + unique",
+	check_sequence(N, function() return START end, xorshift64(42ULL)))
+
+-- Worst-case randomness: the counter always starts at its maximum initial value,
+-- so the most increments are needed to stay ordered within one tick.
+ok("1 ms ticks with maximal counter seeds",
+	check_sequence(N, fake_clock(START, 37LL, 1000000LL, jumps), function() return 0xFFFFFFFFFFFFFFFFULL end))
+
+-- Counter exhaustion within one tick borrows the next nanosecond instead of wrapping.
+do
+	local max = bit.lshift(1ULL, 54) - 1ULL
+	local eff, ctr, kind = core.advance(START, max, START, false, function() return 5ULL end)
+	ok("counter overflow borrows +1 ns", eff == START + 1LL and kind == "ts_ahead", tostring(eff) .. " " .. kind)
+	ok("counter overflow reseeds from injected random", ctr == 5ULL, tostring(ctr))
+end
+
+-- Injected randomness reaches the counter seed (masked to 53 bits).
+do
+	local eff, ctr, kind = core.advance(nil, nil, START, false, function() return 0xFFFFFFFFFFFFFFFFULL end)
+	ok("new tick seeds counter from injected random (53-bit mask)",
+		eff == START and kind == "new" and ctr == bit.lshift(1ULL, 53) - 1ULL, tostring(ctr))
+end
+
+-- Without injection, the default generator path is unchanged.
+do
+	local b = core.generate_bytes(core.new_counter("memory"), START)
+	ok("default generate_bytes still yields version 7", bit.rshift(b[7], 4) == 7)
+end
+
+io.write(("%d/%d clock tests passed\n"):format(tests - fails, tests))
+os.exit(fails == 0 and 0 or 1)

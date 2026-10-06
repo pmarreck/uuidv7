@@ -63,6 +63,7 @@
             luajit tests/uuidv7_json_test
             bash   tests/uuidv7_test
             bash   tests/uuidv7_layout_test
+            luajit tests/uuidv7_clock_test     # injected coarse/backward clock ordering
             luajit tests/uuidv7_daemon_test
             bash   tests/uuidv7_extract_test
             luajit tests/uuidv7_fallback_test
