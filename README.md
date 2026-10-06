@@ -1,7 +1,12 @@
 # uuidv7
 
-A small, fast [UUIDv7](https://www.rfc-editor.org/rfc/rfc9562) generator written in
-[LuaJIT](https://luajit.org/). UUIDv7 values are **time-ordered**, so they sort
+[![Mechatron Prime CI](https://img.shields.io/endpoint?url=https%3A%2F%2Fthelio-nixos.tail66c90.ts.net%2Fbadges%2Fuuidv7.json&style=for-the-badge)](https://thelio-nixos.tail66c90.ts.net/mechatron-prime/)
+
+A small, fast [UUIDv7](https://www.rfc-editor.org/rfc/rfc9562) generator, in two
+implementations: the original in [LuaJIT](https://luajit.org/) (`uuidv7`, with an
+optional daemon) and a port with a pure [Zig](https://ziglang.org/) core, a C ABI and
+a C CLI (`uuidv7z`). The LuaJIT version is the reference: differential tests require
+the Zig port to produce byte-identical results for identical inputs. UUIDv7 values are **time-ordered**, so they sort
 chronologically and make excellent database primary keys (far better index locality
 than random UUIDv4).
 
@@ -21,7 +26,8 @@ remain strictly ordered and unique.
 - **54-bit monotonic counter** in the rest of `rand_b` — random-initialized each
   nanosecond tick, incremented only on a same-nanosecond collision (so in practice every
   UUID still carries ~53 bits of fresh entropy). Cross-process via System V shared memory
-  (Linux) or a `flock`'d file (macOS), both under `$TMPDIR`
+  (Linux), a `flock`'d file (macOS) or a `LockFileEx`-locked file (Windows), all under
+  `$TMPDIR` (Windows: `%TMPDIR%`, `%TEMP%` or `%TMP%`)
 - **Clock-rollback safe** — freeze-and-increment keeps monotonicity regardless of how far
   the wall clock jumps back (the 54-bit counter can't overflow in any real window)
 - **Hyphenated or compact** output; **zero heavy deps** — just LuaJIT
@@ -32,7 +38,9 @@ remain strictly ordered and unique.
 ### Behavior & environment
 
 - `uuidv7 <nanoseconds>` uses an explicit timestamp (honored *exactly* — 64-bit-parsed,
-  not rounded through a double), useful for testing/reproducibility.
+  not rounded through a double), useful for testing/reproducibility. It must be in
+  0..9223372036854775807; anything else exits 1 with "timestamp out of range" (a UUIDv7
+  cannot encode pre-1970 time, and an overflow must not silently become a wrong time).
 - `TMPDIR` — where the cross-process counter state lives (default `/tmp`).
 - `UUIDV7_SILENCE_INSECURE_RANDOM=1` — mute the red stderr warning that fires if no secure
   RNG (`getrandom`/`getentropy`/`/dev/urandom`) is available and it must fall back to the
@@ -56,6 +64,51 @@ uuidv7 --extract-timestamp    017f22e279b077ffbfc90c9a45e78a47      # defaults t
 ```
 
 Run `uuidv7 --help` for the full list.
+
+## Platforms
+
+| Platform | `uuidv7` (LuaJIT) | `uuidv7z` (Zig + C) | How it was verified |
+|---|---|---|---|
+| Linux x86_64 | yes, with daemon | yes (static musl) | `./test` on real hardware and in `nix flake check` (Mechatron Prime CI) |
+| macOS aarch64 | yes, with daemon | yes | `./test` on a real Apple-silicon Mac (macOS 26.7) |
+| Windows x86_64 | yes, no daemon | yes | `./test` under Git Bash on real Windows 10, with a static mingw LuaJIT and cross-compiled `uuidv7z.exe`/`uuidv7.dll` |
+| Linux aarch64 | expected | cross-compiled | build and file-header check only (`./build-all`) |
+| Windows aarch64 | expected | cross-compiled | build and file-header check only (`./build-all`) |
+
+On Windows the clock is `GetSystemTimePreciseAsFileTime` (100 ns ticks; the counter keeps
+values strictly ordered within a tick), randomness comes from `BCryptGenRandom`, and the
+daemon is not available: `--daemon` and `--api` exit 1 with an explanation, and the
+plain CLI always generates locally. Coarse clocks are covered by
+`tests/uuidv7_clock_test`, which injects 1 ms, 100 ns and 1 ns clocks, including clocks
+that step backward, and requires strictly increasing, unique output.
+
+## uuidv7z: the Zig port
+
+```sh
+./build                      # build this host's uuidv7z and publish bin/<os>/<arch>/uuidv7z
+./build --backend=direct     # plain `zig build` instead of `nix build`
+./build-all                  # cross-compile all targets into zig-out/<triple>/ReleaseFast
+bin/linux/x86_64/uuidv7z --hyphen
+```
+
+`uuidv7z` accepts the same arguments and produces the same results as `uuidv7`, except
+that it has no daemon (`--daemon`/`--api` are refused) and no `--test`, and `--about`
+prints its version and platform. It keeps its own cross-process counter in
+`$TMPDIR/uuidv7z-sequence`, so values from `uuidv7` and `uuidv7z` running on one
+machine are each strictly ordered, but not ordered with respect to each other.
+
+The pieces:
+
+- `src/uuidv7.zig`: the pure core. No I/O, clock or allocation; the caller passes the
+  time, a random value and the stored counter state.
+- `include/uuidv7.h` and `src/ffi.zig`: the C ABI (pointer + length buffers, no
+  NUL-terminated strings), built as `libuuidv7.a` and a shared library.
+- `c/uuidv7z.c`: the CLI. It does all the I/O and calls the core only through the C ABI.
+
+Build products per target: `x86_64-linux-musl` and `aarch64-linux-musl` (static
+executables), `aarch64-macos`, `x86_64-windows-gnu` and `aarch64-windows-gnu`. The
+core also compiles for `wasm32-freestanding` (`./build-all` checks this), so it could
+serve JavaScript hosts that cannot run LuaJIT; no such integration exists yet.
 
 ## Daemon
 
@@ -132,18 +185,25 @@ Put `bin/` on your `PATH`. Requires `luajit` on your `PATH`.
 ```sh
 direnv allow      # or: nix develop
 ./test            # run the suite
-nix flake check   # hermetic CI check (also what Garnix runs)
+nix flake check   # hermetic CI check (what Mechatron Prime CI runs)
 ```
 
-`./test` runs eight suites: the JSON writer, the core generator, the RFC bit-layout
+`./test` is the single entry point. Besides the Zig unit tests (Debug and ReleaseFast)
+and the injected-clock suite, it runs two differential suites with the LuaJIT code as
+the oracle: `tests/uuidv7_differential_test` loads the Zig shared library through
+LuaJIT's FFI and compares every C ABI function against `lib/uuidv7_core.lua` on edge
+cases and seeded random samples, and `tests/uuidv7z_cli_test` compares the two CLIs'
+exit codes and output. It also runs the original eight suites: the JSON writer, the core generator, the RFC bit-layout
 contract, the daemon black-box test (which starts a real daemon and drives it — no
 sleeps; it synchronizes on the daemon's readiness line and on stdout EOF), timestamp
 extraction, the daemon retry / no-silent-fallback policy, a **load test** (many parallel
 clients; gates on correctness invariants only — zero duplicates, strictly-ascending
 per-connection streams, client↔server count reconciliation, no crashes — never on
 timing), and a **fuzz test** (hostile/malformed/partial protocol input; seeded and
-reproducible). All eight also run under `nix flake check` (and Garnix, including
-x86_64-linux). Raw throughput/latency lives in `bench/uuidv7_bench`, kept out of the
+reproducible). On Windows, the four daemon suites are reported as not applicable and
+`tests/uuidv7_windows_test` runs instead. Everything also runs under `nix flake check`,
+which Mechatron Prime CI (the
+project's continuous-integration service) builds for every push. Raw throughput/latency lives in `bench/uuidv7_bench`, kept out of the
 pass/fail suites so loaded CI never makes them flaky.
 
 ## Layout
@@ -154,11 +214,20 @@ lib/uuidv7_core.lua         generation core: bit layout + counter backends (sing
 lib/uuidv7_daemon.lua       the UDS daemon (poll loop, protocol, stats, JSONL log, re-exec)
 lib/uuidv7_client.lua       UDS client (CLI fast-path + test driver)
 lib/uuidv7_json.lua         minimal, escape-everything JSON encoder
-tests/uuidv7_{json,test,layout,daemon,extract,fallback,load,fuzz}_test   the eight CI suites
+tests/uuidv7_{json,test,layout,daemon,extract,fallback,load,fuzz}_test   the eight original suites
+tests/uuidv7_clock_test                       injected coarse/backward clock ordering
+tests/uuidv7_windows_test                     Windows CLI contract (not applicable elsewhere)
+tests/uuidv7_differential_test                Zig C ABI vs the LuaJIT core
+tests/uuidv7z_cli_test                        uuidv7z CLI vs the LuaJIT CLI
 tests/uuidv7_sysv_counter_test                Linux-only SysV test (reference; not in CI)
 alternates/uuidv7.{bash,sh}                   pure-bash / POSIX-sh references (not installed)
-flake.nix                   dev shell, packaged + wrapped binary, and CI check
-test                        test runner
+src/uuidv7.zig              pure Zig core (port of lib/uuidv7_core.lua)
+src/ffi.zig, include/uuidv7.h   C ABI
+c/uuidv7z.c                 C CLI over the C ABI
+build.zig, build.zig.zon    Zig build graph
+build, build-all            host build + publish; cross-compile and verify all targets
+flake.nix                   dev shell, both packages, and the CI check
+test                        the complete test entry point
 ```
 
 The `alternates/` implementations are earlier takes kept for lineage/comparison. They

@@ -6,7 +6,7 @@ local _self = (arg and arg[0] or ""):match("^(.*)[/\\][^/\\]+$") or "."
 package.path = table.concat({
 	_self .. "/?.lua",
 	_self .. "/../lib/?.lua",
-	(os.getenv("HOME") or "") .. "/Documents-CloudManaged/uuidv7/lib/?.lua",
+	(os.getenv("HOME") or "") .. "/Code/uuidv7/lib/?.lua",
 	package.path,
 }, ";")
 local core = require("uuidv7_core")
@@ -163,7 +163,7 @@ local function main(args)
 		local candidates = {}
 		if os.getenv("UUIDV7_TEST_FILE") then candidates[#candidates+1] = os.getenv("UUIDV7_TEST_FILE") end
 		if self_dir then candidates[#candidates+1] = self_dir .. "/../tests/uuidv7_test"; candidates[#candidates+1] = self_dir .. "/tests/uuidv7_test" end
-		candidates[#candidates+1] = (os.getenv("HOME") or "") .. "/Documents-CloudManaged/uuidv7/tests/uuidv7_test"
+		candidates[#candidates+1] = (os.getenv("HOME") or "") .. "/Code/uuidv7/tests/uuidv7_test"
 		candidates[#candidates+1] = (os.getenv("HOME") or "") .. "/dotfiles/bin/test/uuidv7_test"
 		local found
 		for _, p in ipairs(candidates) do local fh = io.open(p, "r"); if fh then fh:close(); found = p; break end end

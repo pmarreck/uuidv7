@@ -1,0 +1,6 @@
+# Mechatron Prime CI builds these flake attributes for every pushed commit.
+# The check runs ./test: LuaJIT suites, Zig unit tests and both
+# LuaJIT-oracle differential suites against the Zig/C build.
+packages.x86_64-linux.default
+packages.x86_64-linux.uuidv7z
+checks.x86_64-linux.uuidv7-test
