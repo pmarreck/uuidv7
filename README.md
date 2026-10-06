@@ -72,8 +72,8 @@ Run `uuidv7 --help` for the full list.
 | Linux x86_64 | yes, with daemon | yes (static musl) | `./test` on real hardware and in `nix flake check` (Mechatron Prime CI) |
 | macOS aarch64 | yes, with daemon | yes | `./test` on a real Apple-silicon Mac (macOS 26.7) |
 | Windows x86_64 | yes, no daemon | yes | `./test` under Git Bash on real Windows 10, with a static mingw LuaJIT and cross-compiled `uuidv7z.exe`/`uuidv7.dll` |
-| Linux aarch64 | expected | cross-compiled | build and file-header check only (`./build-all`) |
-| Windows aarch64 | expected | cross-compiled | build and file-header check only (`./build-all`) |
+| Linux aarch64 | expected (not run) | yes (static musl) | QEMU user-mode emulation on x86_64: the Zig unit tests and the `uuidv7z` CLI differential pass; no run on real aarch64 Linux hardware |
+| Windows aarch64 | expected (not run) | cross-compiled | build and file-header check only (`./build-all`) |
 
 On Windows the clock is `GetSystemTimePreciseAsFileTime` (100 ns ticks; the counter keeps
 values strictly ordered within a tick), randomness comes from `BCryptGenRandom`, and the

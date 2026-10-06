@@ -1,6 +1,7 @@
 # Dirtree: Stateful directory trees in the CLI for humans and LLMs. https://github.com/pmarreck/dirtree
 ver=1.2
 annotate=[
+	.mechatron-prime/targets = Mechatron Prime CI flake targets (x86_64-linux packages + check)
 	INTENT.md = canonical project purpose (provisional)
 	PLAN.md = checkbox work plan
 	build = host build/publish of uuidv7z (nix default, --backend=direct, --debug, --test)

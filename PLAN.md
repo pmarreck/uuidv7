@@ -16,11 +16,11 @@ Kickoff 2026-10-06: three-OS support, coarse-clock proof, Zig port with LuaJIT a
 - [x] `./build` with cross-compilation for the 5 target triples (2026-10-06 18:06 EDT)
 - [x] Differential suite (LuaJIT oracle via FFI load of the Zig library): encode bytes, extract edges + large sample, sorted sweep (2026-10-06 18:06 EDT)
 - [x] CLI differential: hyphen/compact/case, refusals, exit codes (2026-10-06 18:06 EDT)
-- [ ] Mechatron Prime CI targets manifest + badge
-- [ ] README: platforms, verification methods, Zig CLI
-- [ ] Note wasm32-freestanding feasibility for the Zig core (no integration)
+- [x] Mechatron Prime CI targets manifest + badge: first build PASS on 39bb636, badge PASSING (2026-10-06 18:10 EDT)
+- [x] README: platforms, verification methods, Zig CLI (2026-10-06 18:09 EDT)
+- [x] wasm32-freestanding: the core compiles (checked by ./build-all); exports not exercised by any host yet (2026-10-06 18:06 EDT)
 - [ ] Reproducible Windows test toolchain: flake output for a static mingw LuaJIT (currently built ad hoc with an override)
 - [ ] Windows aarch64 verification (no ARM64 Windows host known; ask)
 - [x] Fix oracle: --extract-timestamp-ns wrapped modulo 2^64; explicit timestamps outside [0, INT64_MAX] now refused (CLI + daemon) (2026-10-06 17:49 EDT)
 - [ ] Ask BDFN: keep the inherited CLI quirks that uuidv7z mirrors? (`uuidv7 - foo` ignores `foo`; `uuidv7 123 --hyphen` ignores `--hyphen`; `uuidv7 123 456` uses 123)
-- [ ] Linux aarch64 runtime verification (cross-compiled only so far)
+- [ ] Linux aarch64 on real hardware (QEMU user-mode: Zig unit tests + uuidv7z CLI differential pass, 2026-10-06 18:10 EDT); LuaJIT side not run there
