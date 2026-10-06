@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Cross-compile uuidv7z for every supported target and verify each product's
+# file headers. Leaves the published host entrypoint (bin/<os>/<arch>/) alone.
+# A successful cross-compile is compile evidence only; runtime verification
+# needs a real run on that platform.
+#
+#   ./build-all            ReleaseFast for all targets
+#   ./build-all --debug    Debug profile
+set -u
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$here" || exit 1
+
+profile=ReleaseFast
+for a in "$@"; do
+	case "$a" in
+		--debug) profile=Debug ;;
+		-h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+		*) echo "build-all: unknown argument '$a'" >&2; exit 2 ;;
+	esac
+done
+
+run() { if command -v zig >/dev/null 2>&1 && command -v file >/dev/null 2>&1; then "$@"; else nix develop -c "$@"; fi; }
+
+# triple | product files | expected `file` description fragments (one per product)
+targets=(
+	"x86_64-linux-musl|bin/uuidv7z lib/libuuidv7.so|ELF 64-bit LSB executable, x86-64*statically linked;ELF 64-bit LSB shared object, x86-64"
+	"aarch64-linux-musl|bin/uuidv7z lib/libuuidv7.so|ELF 64-bit LSB executable, ARM aarch64*statically linked;ELF 64-bit LSB shared object, ARM aarch64"
+	"aarch64-macos|bin/uuidv7z lib/libuuidv7.dylib|Mach-O 64-bit*arm64 executable;Mach-O 64-bit*arm64 dynamically linked shared library"
+	"x86_64-windows-gnu|bin/uuidv7z.exe bin/uuidv7.dll|PE32+ executable*console*x86-64;PE32+ executable*DLL*x86-64"
+	"aarch64-windows-gnu|bin/uuidv7z.exe bin/uuidv7.dll|PE32+ executable*console*ARM64;PE32+ executable*DLL*ARM64"
+	"wasm32-freestanding|bin/uuidv7.wasm|WebAssembly (wasm) binary"
+)
+
+fails=0
+for t in "${targets[@]}"; do
+	IFS='|' read -r triple products expect <<<"$t"
+	prefix="zig-out/$triple/$profile"
+	mkdir -p "zig-out/$triple"
+	if ! run zig build -Doptimize="$profile" -Dtarget="$triple" --prefix "$prefix" >"$prefix.log" 2>&1; then
+		echo "✗ $triple: build failed (see $prefix.log)"; fails=$((fails + 1)); continue
+	fi
+	IFS=';' read -r -a wants <<<"$expect"
+	i=0 ok=1
+	for p in $products; do
+		desc="$(run file -b "$prefix/$p" 2>/dev/null)"
+		# shellcheck disable=SC2053
+		if [[ "$desc" != ${wants[$i]}* ]]; then
+			echo "✗ $triple: $p is '$desc', expected '${wants[$i]}'"; ok=0
+		fi
+		i=$((i + 1))
+	done
+	if [ "$ok" = 1 ]; then echo "✓ $triple: $products"; else fails=$((fails + 1)); fi
+done
+[ "$fails" -eq 0 ] && echo "all ${#targets[@]} targets built and verified by file header (compile evidence only)"
+exit "$fails"

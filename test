@@ -7,12 +7,38 @@ export LUA_PATH="$here/lib/?.lua;;"
 export UUIDV7_TEST_FILE="$here/tests/uuidv7_test"
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) windows=1 ;; *) windows=0 ;; esac
 rc=0
+# Zig/C products for the differential suites. Preset UUIDV7Z and UUIDV7_ZIG_LIB
+# (e.g. cross-built artifacts for a Windows run) or let this build them now.
+if [ -z "${UUIDV7Z:-}" ] || [ -z "${UUIDV7_ZIG_LIB:-}" ]; then
+	zig_run() { if command -v zig >/dev/null 2>&1; then zig "$@"; else nix develop -c zig "$@"; fi; }
+	# One build; --print-prefix makes the product prefix its last output line.
+	if ! build_log="$("$here/build" --backend=direct --no-publish --print-prefix 2>&1)"; then
+		printf '%s\n' "$build_log" >&2
+		echo "✗ could not build the Zig products; the differential suites cannot run" >&2
+		rc=1
+	else
+		prefix="${build_log##*$'\n'}"
+		export UUIDV7Z="$here/$prefix/bin/uuidv7z"
+		case "$(uname -s)" in Darwin) lib=lib/libuuidv7.dylib ;; *) lib=lib/libuuidv7.so ;; esac
+		export UUIDV7_ZIG_LIB="$here/$prefix/$lib"
+		# Zig core unit tests in both safety modes.
+		for mode in Debug ReleaseFast; do
+			if ztest_log="$(cd "$here" && zig_run build test -Doptimize=$mode --summary none 2>&1)"; then
+				echo "Zig core unit tests passed ($mode)"
+			else
+				printf '%s\n' "$ztest_log" >&2; echo "✗ Zig core unit tests failed ($mode)" >&2; rc=1
+			fi
+		done
+	fi
+fi
 "$here/tests/uuidv7_json_test"   || rc=$?   # mini JSON writer (+ escaping)
 "$here/tests/uuidv7_test"        || rc=$?   # core generator
 "$here/tests/uuidv7_layout_test" || rc=$?   # RFC bit-layout contract
 "$here/tests/uuidv7_clock_test"  || rc=$?   # injected coarse/backward clock ordering
 "$here/tests/uuidv7_extract_test" || rc=$?   # timestamp extraction round-trip
 "$here/tests/uuidv7_windows_test" || rc=$?   # Windows CLI contract (n/a elsewhere)
+"$here/tests/uuidv7_differential_test" || rc=$?   # Zig core vs LuaJIT oracle through the C ABI
+"$here/tests/uuidv7z_cli_test"  || rc=$?   # uuidv7z CLI vs LuaJIT CLI
 if [ "$windows" -eq 1 ]; then
 	# The daemon is Unix-only by design (Unix-domain socket, poll(2), re-exec);
 	# uuidv7_windows_test asserts that --daemon and --api refuse on Windows.

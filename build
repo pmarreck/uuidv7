@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Build uuidv7z (Zig core + C ABI library + C CLI) for this host and publish
+# bin/<os>/<arch>/uuidv7z as a relative symlink to the product tree.
+#
+#   ./build                      Nix backend, ReleaseFast (default)
+#   ./build --backend=direct     zig build directly (via `nix develop` if zig is not on PATH)
+#   ./build --debug              direct backend, Debug profile (announces DEBUG BUILD!)
+#   ./build --test               also run the Zig unit tests
+#   ./build --no-publish         build only; leave bin/<os>/<arch>/ untouched
+#   ./build --print-prefix       print only the product prefix on stdout (logs to stderr)
+#
+# Products: zig-out/<triple>/<profile>/{bin,lib,include} (direct) or
+# .nix-out/<triple>/ReleaseFast -> /nix/store/... (nix). Equivalent native command:
+#   zig build -Doptimize=ReleaseFast -Dtarget=<triple> --prefix zig-out/<triple>/ReleaseFast
+# No `set -e`: every failure is reported explicitly.
+set -u
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$here" || exit 1
+
+backend=nix profile=ReleaseFast run_tests=0 publish=1 print_prefix=0
+for a in "$@"; do
+	case "$a" in
+		--backend=nix|--backend=direct) backend="${a#--backend=}" ;;
+		--debug) profile=Debug; backend=direct ;;
+		--test) run_tests=1 ;;
+		--no-publish) publish=0 ;;
+		--print-prefix) print_prefix=1 ;;
+		-h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+		*) echo "build: unknown argument '$a'" >&2; exit 2 ;;
+	esac
+done
+
+# Host platform -> PATH directory and portable target triple.
+case "$(uname -s)" in
+	Linux) os=linux ;;
+	Darwin) os=macos ;;
+	MINGW*|MSYS*|CYGWIN*) os=windows ;;
+	*) echo "build: unsupported OS $(uname -s)" >&2; exit 1 ;;
+esac
+case "$(uname -m)" in
+	x86_64|amd64|AMD64) arch=x86_64 ;;
+	aarch64|arm64) arch=aarch64 ;;
+	*) echo "build: unsupported architecture $(uname -m)" >&2; exit 1 ;;
+esac
+case "$os" in
+	linux) triple="$arch-linux-musl" ;;
+	macos) triple="$arch-macos" ;;
+	windows) triple="$arch-windows-gnu" ;;
+esac
+
+zig_cmd() {
+	if command -v zig >/dev/null 2>&1; then zig "$@"; else nix develop -c zig "$@"; fi
+}
+
+if [ "$backend" = nix ]; then
+	prefix=".nix-out/$triple/ReleaseFast"
+	mkdir -p "$(dirname "$prefix")"
+	# path: flake so new, not-yet-staged source files are included.
+	if ! nix build "path:$here#uuidv7z" --out-link "$prefix" >&2; then
+		echo "build FAILED (nix build)" >&2; exit 1
+	fi
+else
+	prefix="zig-out/$triple/$profile"
+	if ! zig_cmd build -Doptimize="$profile" -Dtarget="$triple" --prefix "$prefix" >&2; then
+		echo "build FAILED (zig build -Dtarget=$triple -Doptimize=$profile)" >&2; exit 1
+	fi
+fi
+
+exe="$prefix/bin/uuidv7z"; [ "$os" = windows ] && exe="$exe.exe"
+if ! about="$(MUTE_DEBUG_STATUS=1 "$exe" --about)"; then
+	echo "build FAILED: $exe does not run" >&2; exit 1
+fi
+
+if [ "$run_tests" = 1 ] && ! zig_cmd build test -Doptimize="$profile" >&2; then
+	echo "build FAILED: Zig unit tests" >&2; exit 1
+fi
+
+if [ "$publish" = 1 ] && [ "$os" != windows ]; then
+	# Atomic replace: build the new link beside the old one, then rename over it.
+	dir="bin/$os/$arch"
+	mkdir -p "$dir"
+	ln -sfn "../../../$exe" "$dir/.uuidv7z.$$"
+	mv -f "$dir/.uuidv7z.$$" "$dir/uuidv7z"
+	echo "published $dir/uuidv7z -> ../../../$exe" >&2
+fi
+echo "built $prefix: $about" >&2
+[ "$print_prefix" = 1 ] && echo "$prefix"
+exit 0

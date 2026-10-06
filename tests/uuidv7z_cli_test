@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# CLI differential: the LuaJIT `uuidv7` is the oracle for the Zig/C `uuidv7z`.
+# Deterministic commands must match exactly (exit code, stdout, stderr with the
+# program name normalized). Generated values carry a random counter, so they are
+# compared through their shape and their extracted timestamps instead.
+set -u
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+lua_cli=(luajit "$here/../bin/uuidv7")
+zig_cli="${UUIDV7Z:?set UUIDV7Z to the uuidv7z executable}"
+export UUIDV7_NO_DAEMON=1
+unset UUIDV7_NS_EXTRACT_OK
+# A path with a space: the counter state file lives here.
+TMPDIR="$(mktemp -d)/state dir"; mkdir -p "$TMPDIR"; export TMPDIR
+trap 'rm -rf "$(dirname "$TMPDIR")"' EXIT
+
+tests=0 fails=0
+pass() { tests=$((tests + 1)); echo "✓ $1"; }
+fail() { tests=$((tests + 1)); fails=$((fails + 1)); echo "✗ $1" >&2; }
+check() { if eval "$2"; then pass "$1"; else fail "$1 [$2]"; fi; }
+# run <var-prefix> <cmd...>: capture stdout, stderr and exit code.
+run() {
+	local p="$1"; shift
+	local o e r
+	o="$("$@" 2>"$TMPDIR/stderr")"; r=$?
+	e="$(cat "$TMPDIR/stderr")"
+	printf -v "${p}_out" '%s' "$o"; printf -v "${p}_err" '%s' "$e"; printf -v "${p}_rc" '%s' "$r"
+}
+# Exact agreement on a deterministic command line.
+same() {
+	run L "${lua_cli[@]}" "$@"
+	run Z "$zig_cli" "$@"
+	local zerr="${Z_err//uuidv7z/uuidv7}"
+	if [ "$L_rc" = "$Z_rc" ] && [ "$L_out" = "$Z_out" ] && [ "$L_err" = "$zerr" ]; then
+		pass "same: uuidv7 $* (rc=$L_rc)"
+	else
+		fail "same: uuidv7 $*: lua rc=$L_rc out=[$L_out] err=[$L_err] | zig rc=$Z_rc out=[$Z_out] err=[$zerr]"
+	fi
+}
+
+U=017f22e2-79b0-77ff-bfc9-0c9a45e78a47
+UC=017F22E279B077FFBFC90C9A45E78A47
+# ---- extraction: exact match, including warnings and refusals ----
+for flag in --extract-timestamp --extract-timestamp-ms --extract-timestamp-ns; do
+	same "$flag" "$U"
+	same "$flag" "$UC"
+	same "$flag" --mute-warning "$U"
+	same "$flag" "$U" --mute-warning
+	same "$flag" ffffffff-ffff-7fff-bfff-ffffffffffff --mute-warning
+	same "$flag" 00000000-0000-7000-8000-000000000000
+	same "$flag" 0-17f22e279b077ffbfc90c9a45e78a4-7
+	same "$flag" not-a-uuid
+	same "$flag" "${U}0"
+	same "$flag" ""
+	same "$flag"
+done
+for v in 1 true TRUE 0 no; do
+	export UUIDV7_NS_EXTRACT_OK="$v"
+	same --extract-timestamp-ns "$U"
+done
+unset UUIDV7_NS_EXTRACT_OK
+
+# ---- refusals ----
+same --bogus
+same -x
+same abc
+same 12abc
+same +5
+for bad in -1 -1000001 9223372036854775808 99999999999999999999; do
+	same "$bad"
+	same --hyphen "$bad"
+	same - "$bad"
+done
+same --help -1
+
+# ---- generation: shape, exit code, clean stderr, exact timestamps ----
+shape() {  # shape <name> <hyphens:0|1> <args...>
+	local name="$1" h="$2"; shift 2
+	local re='^[0-9a-f]{32}$'
+	[ "$h" = 1 ] && re='^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+	run L "${lua_cli[@]}" "$@"
+	run Z "$zig_cli" "$@"
+	if [ "$L_rc" = 0 ] && [ "$Z_rc" = 0 ] && [ -z "$L_err" ] && [ -z "$Z_err" ] &&
+		[[ "$L_out" =~ $re ]] && [[ "$Z_out" =~ $re ]]; then
+		pass "shape: uuidv7 $*"
+	else
+		fail "shape: uuidv7 $*: lua rc=$L_rc [$L_out] [$L_err] | zig rc=$Z_rc [$Z_out] [$Z_err]"
+	fi
+}
+shape plain 0
+shape hyphen 1 --hyphen
+shape hyphens 1 --hyphens
+shape dash 1 -
+shape static 0 1700000000000000123
+shape static-hyphen 1 --hyphen 1700000000000000123
+shape dash-garbage 1 - foo
+shape static-then-flag 0 123 --hyphen
+
+# Explicit timestamps are encoded exactly by both (via the oracle's extractor).
+for args in "1700000000000000123" "--hyphen 1645557742000524287" "- 0" "999999" "1000000" \
+	"9223372036854775807" "123 456" "123 --hyphen" "--hyphens 5 7"; do
+	# shellcheck disable=SC2086
+	lu=$("${lua_cli[@]}" $args); zu=$("$zig_cli" $args)
+	lt=$("${lua_cli[@]}" --extract-timestamp-ns --mute-warning "$lu")
+	zt=$("${lua_cli[@]}" --extract-timestamp-ns --mute-warning "$zu")
+	check "same encoded time for: $args ($lt)" '[ -n "$lt" ] && [ "$lt" = "$zt" ] && [ "${#lu}" = "${#zu}" ]'
+done
+
+# ---- cross-process ordering and uniqueness for uuidv7z ----
+# ordered_run <args...>: 60 sequential processes; prints how many were
+# well-formed and strictly greater than their predecessor.
+ordered_run() {
+	local prev="" cur good=0
+	for i in $(seq 1 60); do
+		cur="$("$zig_cli" "$@")"
+		if [[ "$cur" =~ ^[0-9a-f]{32}$ ]] && [[ "$cur" > "$prev" ]]; then good=$((good + 1)); fi
+		prev="$cur"
+	done
+	echo "$good"
+}
+n=$(ordered_run 1700000000000000000)
+check "uuidv7z: 60 processes at one static ns strictly increasing ($n/60)" '[ "$n" = 60 ]'
+n=$(ordered_run)
+check "uuidv7z: 60 live processes strictly increasing ($n/60)" '[ "$n" = 60 ]'
+check "uuidv7z: counter state file is in TMPDIR (path with a space)" '[ -s "$TMPDIR/uuidv7z-sequence" ]'
+for w in 1 2 3 4 5 6 7 8; do
+	( for i in $(seq 1 20); do "$zig_cli" 1700000000000000000; done > "$TMPDIR/w$w" ) &
+done
+wait
+all="$(cat "$TMPDIR"/w1 "$TMPDIR"/w2 "$TMPDIR"/w3 "$TMPDIR"/w4 "$TMPDIR"/w5 "$TMPDIR"/w6 "$TMPDIR"/w7 "$TMPDIR"/w8)"
+check "uuidv7z: 8 concurrent workers x 20 = 160 values" '[ "$(printf "%s\n" "$all" | wc -l)" -eq 160 ]'
+check "uuidv7z: 8 concurrent workers x 20 all unique" '[ "$(printf "%s\n" "$all" | sort -u | wc -l)" -eq 160 ]'
+
+# ---- uuidv7z-specific surface ----
+run Z "$zig_cli" --about
+check "--about is one line with name, version and platform" \
+	'[ "$Z_rc" = 0 ] && [ "$(printf "%s\n" "$Z_out" | wc -l)" -eq 1 ] && [[ "$Z_out" == "uuidv7z 0.2.0 "*"("*"-"*")" ]]'
+run Z "$zig_cli" -a
+check "-a matches --about" '[ "$Z_rc" = 0 ] && [[ "$Z_out" == "uuidv7z 0.2.0 "* ]]'
+for h in -h --help; do
+	run Z "$zig_cli" "$h"
+	check "$h prints usage" '[ "$Z_rc" = 0 ] && [[ "$Z_out" == *"Usage: uuidv7z"* ]] && [[ "$Z_out" == *"--extract-timestamp-ns"* ]]'
+done
+for d in --daemon --api --raw --socket-api; do
+	run Z "$zig_cli" "$d"
+	check "$d is refused (LuaJIT-only daemon)" '[ "$Z_rc" = 1 ] && [ -z "$Z_out" ] && [[ "$Z_err" == *"not supported by uuidv7z"* ]]'
+done
+
+echo "$((tests - fails))/$tests uuidv7z CLI differential tests passed"
+[ "$fails" -eq 0 ]

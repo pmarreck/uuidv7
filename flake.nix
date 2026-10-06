@@ -44,24 +44,57 @@
             mainProgram = "uuidv7";
           };
         };
+        # Portable products: static musl on Linux, the native target on macOS.
+        zigTarget = {
+          x86_64-linux = "x86_64-linux-musl";
+          aarch64-linux = "aarch64-linux-musl";
+        }.${system} or "native";
+
+        # uuidv7z: Zig core + C ABI library + C CLI, built by build.zig.
+        uuidv7z = pkgs.stdenv.mkDerivation {
+          pname = "uuidv7z";
+          version = "0.2.0";
+          src = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [ ./build.zig ./build.zig.zon ./src ./include ./c ];
+          };
+          nativeBuildInputs = [ zig ];
+          dontConfigure = true;
+          dontInstall = true;
+          buildPhase = ''
+            runHook preBuild
+            export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-global" ZIG_LOCAL_CACHE_DIR="$TMPDIR/zig-local"
+            ${pkgs.lib.optionalString pkgs.stdenv.isDarwin "unset NIX_CFLAGS_COMPILE NIX_LDFLAGS"}
+            zig build -Doptimize=ReleaseFast -Dtarget=${zigTarget} --prefix "$out"
+            runHook postBuild
+          '';
+          meta = with pkgs.lib; {
+            description = "RFC 9562 UUIDv7: pure Zig core, C ABI library and C CLI";
+            license = licenses.mit;
+            platforms = platforms.unix;
+            mainProgram = "uuidv7z";
+          };
+        };
       in {
         packages.default = uuidv7;
         packages.uuidv7 = uuidv7;
+        packages.uuidv7z = uuidv7z;
 
         # Garnix runs this on every push (notably x86_64-linux) — it exercises the
         # full suite INCLUDING the daemon black-box test, so cross-platform breakage
         # (sockaddr_un, O_NONBLOCK, accept() flag inheritance, etc.) is caught here.
         checks.uuidv7-test = pkgs.runCommand "uuidv7-test"
-          { nativeBuildInputs = runtimeTools ++ testTools; } ''
+          { nativeBuildInputs = runtimeTools ++ testTools ++ [ zig pkgs.file ]; } ''
             cp -r ${./.} work
             chmod -R u+w work
             cd work
-            patchShebangs bin tests test
+            patchShebangs bin tests test build
             export HOME="$TMPDIR"
             export PATH="$PWD/bin:$PATH"
             export LUA_PATH="$PWD/lib/?.lua;;"
             export UUIDV7_TEST_FILE="$PWD/tests/uuidv7_test"
             export UUIDV7_SILENCE_INSECURE_RANDOM=1
+            export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-global" ZIG_LOCAL_CACHE_DIR="$TMPDIR/zig-local"
             bash ./test   # the single complete entry point (every suite)
             luajit bench/uuidv7_bench 50000   # validates the bench runs + its correctness check on Linux
             touch $out

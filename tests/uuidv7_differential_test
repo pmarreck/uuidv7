@@ -1,0 +1,341 @@
+#!/usr/bin/env luajit
+-- Differential test: the LuaJIT core (lib/uuidv7_core.lua) is the oracle for the
+-- Zig core, reached through its C ABI (include/uuidv7.h) in the shared library
+-- named by $UUIDV7_ZIG_LIB. Every case is seeded and reproducible; override with
+-- UUIDV7_DIFF_SEED / UUIDV7_DIFF_SCALE (multiplies sample counts).
+-- Besides agreement, it runs checks neither implementation authored for itself:
+-- RFC 9562 version/variant bits, round-trips in both directions, sorted sweeps.
+
+local self_dir = (arg and arg[0] or ""):match("^(.*)[/\\][^/\\]+$") or "."
+package.path = self_dir .. "/../lib/?.lua;" .. package.path
+local ffi = require("ffi")
+local bit = require("bit")
+local core = require("uuidv7_core")
+
+local lib_path = os.getenv("UUIDV7_ZIG_LIB")
+if not lib_path or lib_path == "" then
+	io.stderr:write("uuidv7_differential_test: set UUIDV7_ZIG_LIB to the Zig shared library\n")
+	os.exit(1)
+end
+
+-- Parse the shipped header: #define constants into H, declarations into ffi.cdef.
+local H, decls = {}, {}
+do
+	local f = assert(io.open(self_dir .. "/../include/uuidv7.h", "rb"))
+	local text = f:read("*a"); f:close()
+	text = text:gsub("/%*.-%*/", "")
+	local skip = false
+	for line in text:gmatch("[^\n]*") do
+		if line:match("^#ifdef __cplusplus") then skip = true
+		elseif skip and line:match("^#endif") then skip = false
+		elseif not skip then
+			local name, val = line:match("^#define%s+(UUIDV7_[%w_]+)%s+(%-?%d+)")
+			if name then H[name] = tonumber(val)
+			elseif not line:match("^%s*#") then decls[#decls + 1] = line end
+		end
+	end
+end
+ffi.cdef(table.concat(decls, "\n"))
+local Z = ffi.load(lib_path)
+
+local SEED = tonumber(os.getenv("UUIDV7_DIFF_SEED") or "") or 20261006
+local SCALE = tonumber(os.getenv("UUIDV7_DIFF_SCALE") or "") or 1
+io.write(("differential seed=%d scale=%s lib=%s\n"):format(SEED, tostring(SCALE), lib_path))
+
+local tests, fails = 0, 0
+local function check(name, cond, detail)
+	tests = tests + 1
+	if cond then io.write("\u{2713} " .. name .. "\n")
+	else io.stderr:write("\u{2717} " .. name .. (detail and (": " .. detail) or "") .. "\n"); fails = fails + 1 end
+end
+
+-- Seeded xorshift64* for 64-bit samples.
+local rs = ffi.new("uint64_t[1]", SEED)
+local function rand64()
+	local x = rs[0]
+	x = bit.bxor(x, bit.rshift(x, 12)); x = bit.bxor(x, bit.lshift(x, 25)); x = bit.bxor(x, bit.rshift(x, 27))
+	rs[0] = x
+	return x * 0x2545F4914F6CDD1DULL
+end
+local function randint(n) return tonumber(rand64() % ffi.cast("uint64_t", n)) end
+
+local INT64_MAX = 9223372036854775807LL
+local NS = 1000000LL
+local function dec(v) return (tostring(v):gsub("[uUlL]+$", "")) end
+
+-- ---------- helpers over the C ABI ----------
+local bytes16 = ffi.new("uint8_t[16]")
+local text_out = ffi.new("char[64]")
+local len_out = ffi.new("size_t[1]")
+local function z_format(ns, ctr, hyphens)
+	assert(Z.uuidv7_encode(ns, ctr, bytes16, 16) == H.UUIDV7_OK)
+	assert(Z.uuidv7_format(bytes16, 16, hyphens and 1 or 0, text_out, 64, len_out) == H.UUIDV7_OK)
+	return ffi.string(text_out, len_out[0])
+end
+local function z_extract(s, unit_ns)
+	local rc = Z.uuidv7_extract(s, #s, unit_ns and 1 or 0, text_out, 64, len_out)
+	if rc ~= H.UUIDV7_OK then return nil, rc end
+	return ffi.string(text_out, len_out[0])
+end
+local i64_out = ffi.new("int64_t[1]")
+local function z_parse(s)
+	local rc = Z.uuidv7_parse_timestamp(s, #s, i64_out)
+	if rc == H.UUIDV7_OK then return i64_out[0] end
+	return nil, rc
+end
+
+-- ---------- 1. encode + format: byte-identical for the same ns and counter ----------
+do
+	local edges_ns = { 0LL, 1LL, 255LL, 256LL, 999999LL, 1000000LL, 1000001LL, 1048575LL,
+		1700000000000000123LL, INT64_MAX, INT64_MAX - 1LL, (INT64_MAX / NS) * NS, (INT64_MAX / NS) * NS - 1LL }
+	local edges_ctr = { 0ULL, 1ULL, 0x1FFFFFFFFFFFFFULL, 0x20000000000000ULL, 0x3FFFFFFFFFFFFFULL,
+		0x40000000000000ULL, 0xFFFFFFFFFFFFFFFFULL }
+	local mismatch, n, bad_layout = nil, 0, nil
+	local function cmp(ns, ctr)
+		n = n + 1
+		local b = core.encode_bytes(ns, ctr)
+		for _, h in ipairs({ true, false }) do
+			local want, got = core.format_uuid(b, h), z_format(ns, ctr, h)
+			if want ~= got and not mismatch then mismatch = ("ns=%s ctr=%s want=%s got=%s"):format(dec(ns), dec(ctr), want, got) end
+		end
+		-- Independent RFC 9562 check: version nibble 7, variant bits 10.
+		if bit.rshift(bytes16[6], 4) ~= 7 or bit.rshift(bytes16[8], 6) ~= 2 then bad_layout = dec(ns) end
+	end
+	for _, ns in ipairs(edges_ns) do for _, c in ipairs(edges_ctr) do cmp(ns, c) end end
+	for _ = 1, 200000 * SCALE do
+		local ns
+		local r = randint(4)
+		if r == 0 then ns = ffi.cast("int64_t", bit.rshift(rand64(), 1))          -- full range
+		elseif r == 1 then ns = ffi.cast("int64_t", rand64() % 4000000000000000000ULL) -- realistic era
+		elseif r == 2 then ns = ffi.cast("int64_t", randint(3000000000)) * NS + randint(3) - 1 -- ms boundaries
+		else ns = ffi.cast("int64_t", randint(2000000))                             -- tiny
+		end
+		if ns < 0LL then ns = 0LL end
+		cmp(ns, rand64())
+	end
+	check(("encode+format byte-identical (%d cases x 2 formats)"):format(n), not mismatch, mismatch)
+	check("Zig output always has version 7 and variant 10", not bad_layout, bad_layout)
+end
+
+-- ---------- 2. advance: same state, kind and random consumption ----------
+do
+	local KIND = { new = H.UUIDV7_KIND_NEW, same_ns = H.UUIDV7_KIND_SAME_NS,
+		rollback = H.UUIDV7_KIND_ROLLBACK, ts_ahead = H.UUIDV7_KIND_TS_AHEAD }
+	local stored, out = ffi.new("uuidv7_state"), ffi.new("uuidv7_state")
+	local kind, used = ffi.new("uint8_t[1]"), ffi.new("uint8_t[1]")
+	local mismatch, steps, kinds_seen = nil, 0, {}
+	for walk = 1, 40 * SCALE do
+		local have = false
+		local nt, ctr = nil, nil
+		local t = 1700000000000000000LL + randint(1000000000)
+		for _ = 1, 2500 do
+			local r = randint(10)
+			if r < 4 then t = t + randint(3000)            -- forward
+			elseif r < 6 then                                -- same tick
+			elseif r < 7 then t = t - randint(5000000)     -- backward
+			elseif r < 8 and have then                       -- force a counter near overflow
+				ctr = 0x3FFFFFFFFFFFFFULL - ffi.cast("uint64_t", randint(2))
+			end
+			local is_static = randint(8) == 0
+			local cur = is_static and (have and (randint(2) == 0 and nt or t) or t) or t
+			local seed = rand64()
+			local calls = 0
+			local l_eff, l_ctr, l_kind = core.advance(have and nt or nil, have and ctr or nil, cur, is_static,
+				function() calls = calls + 1; return seed end)
+			if have then stored.nanotime, stored.counter = nt, ctr end
+			assert(Z.uuidv7_advance(have and stored or nil, cur, is_static and 1 or 0, seed, out, kind, used) == H.UUIDV7_OK)
+			steps = steps + 1
+			kinds_seen[l_kind] = true
+			if not mismatch and (out.nanotime ~= l_eff or out.counter ~= l_ctr or kind[0] ~= KIND[l_kind]
+				or used[0] ~= calls) then
+				mismatch = ("walk %d step %d: lua=(%s,%s,%s,%d) zig=(%s,%s,%d,%d)"):format(walk, steps,
+					dec(l_eff), dec(l_ctr), l_kind, calls, dec(out.nanotime), dec(out.counter), kind[0], used[0])
+			end
+			nt, ctr, have = l_eff, l_ctr, true
+		end
+	end
+	check(("advance agrees on state, kind and random use (%d steps)"):format(steps), not mismatch, mismatch)
+	check("advance walks covered all four kinds",
+		kinds_seen.new and kinds_seen.same_ns and kinds_seen.rollback and kinds_seen.ts_ahead)
+end
+
+-- ---------- 3. extract: both units, both directions, malformed input ----------
+do
+	local function hex(b) local t = {} for i = 1, 16 do t[i] = ("%02x"):format(b[i]) end return table.concat(t) end
+	local function spell(h, r)  -- random capitalization and hyphenation of 32 hex digits
+		local s = (r % 3 == 0) and h:upper() or h
+		if r % 2 == 0 then s = s:sub(1, 8) .. "-" .. s:sub(9, 12) .. "-" .. s:sub(13, 16) .. "-" .. s:sub(17, 20) .. "-" .. s:sub(21) end
+		if r % 5 == 0 then local p = randint(#s + 1); s = s:sub(1, p) .. "-" .. s:sub(p + 1) end
+		return s
+	end
+	local mismatch, n = nil, 0
+	local function cmp(s)
+		n = n + 1
+		for _, unit in ipairs({ "ms", "ns" }) do
+			local want = core.extract_timestamp(s, unit)
+			local got = z_extract(s, unit == "ns")
+			if want ~= got and not mismatch then
+				mismatch = ("%s %s: lua=%s zig=%s"):format(unit, s, tostring(want), tostring(got))
+			end
+		end
+	end
+	-- Exhaustive edges: ms in {0, 1, 2^47, 2^48-1} x every 20-bit sub-ms value
+	-- at the millisecond-boundary positions, plus every byte at every position.
+	local function with_sub(ms, sub)
+		local hi12, lo8 = bit.rshift(sub, 8), bit.band(sub, 0xFF)
+		return ("%s7%03x%02x%02x%s"):format(ms, hi12, 0x80 + bit.rshift(lo8, 2), bit.lshift(bit.band(lo8, 3), 6), "000000000000")
+	end
+	for _, ms in ipairs({ "000000000000", "000000000001", "800000000000", "ffffffffffff" }) do
+		for sub = 0, 1048575, 97 do cmp(with_sub(ms, sub)) end
+		for sub = 999990, 1000010 do cmp(with_sub(ms, sub)) end
+	end
+	-- Exhaust all 2^20 sub-ms values at the largest ms against a closed-form
+	-- decimal ((2^48-1)*1e6 + sub, which exceeds 2^64) that neither side computed.
+	local closed_bad
+	for sub = 0, 1048575 do
+		local want = sub < 1000000 and ("281474976710655%06d"):format(sub) or ("281474976710656%06d"):format(sub - 1000000)
+		local got = z_extract(with_sub("ffffffffffff", sub), true)
+		if got ~= want and not closed_bad then closed_bad = ("sub=%d want=%s got=%s"):format(sub, want, tostring(got)) end
+	end
+	check("extract-ns exhaustive over 2^20 sub-ms values at max ms (closed form)", not closed_bad, closed_bad)
+	for pos = 1, 16 do
+		for v = 0, 255 do
+			local b = {} for i = 1, 16 do b[i] = 0x5a end
+			b[pos] = v
+			cmp(hex(b))
+		end
+	end
+	-- Random valid-length inputs in every spelling.
+	for _ = 1, 100000 * SCALE do
+		local b = {} for i = 1, 16 do b[i] = randint(256) end
+		cmp(spell(hex(b), randint(30)))
+	end
+	-- Malformed: wrong lengths, a non-hex byte, empty, hyphens only, whitespace.
+	local bad = { "", "-", ("-"):rep(64), " 017f22e279b077ffbfc90c9a45e78a47", "017f22e279b077ffbfc90c9a45e78a47\n",
+		"017f22e279b077ffbfc90c9a45e78a4", "017f22e279b077ffbfc90c9a45e78a477", "{017f22e2-79b0-77ff-bfc9-0c9a45e78a47}" }
+	for _, s in ipairs(bad) do cmp(s) end
+	for _ = 1, 20000 * SCALE do
+		local b = {} for i = 1, 16 do b[i] = randint(256) end
+		local s = hex(b)
+		local r = randint(3)
+		if r == 0 then s = s:sub(1, randint(32))
+		elseif r == 1 then s = s .. hex({ randint(256), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }):sub(1, 1 + randint(4))
+		else local p = 1 + randint(32); s = s:sub(1, p - 1) .. string.char(randint(256)) .. s:sub(p + 1) end
+		cmp(s)
+	end
+	check(("extract ms+ns agree, incl. malformed (%d inputs x 2 units)"):format(n), not mismatch, mismatch)
+
+	-- Round-trip both directions, using only the oracle's encode for y.
+	local rt_bad
+	for _ = 1, 50000 * SCALE do
+		local ns = ffi.cast("int64_t", bit.rshift(rand64(), 1))
+		local ctr = bit.band(rand64(), 0x3FFFFFFFFFFFFFULL)
+		local y = z_format(ns, ctr, randint(2) == 0)
+		local back = z_extract(y, true)
+		if back ~= dec(ns) and not rt_bad then rt_bad = "extract_ns(encode(" .. dec(ns) .. ")) = " .. tostring(back) end
+		-- encode(decode(y)) == y: re-encode the extracted time with y's counter bits.
+		local again = z_format(core.parse_static(back), ctr, y:find("-", 1, true) ~= nil)
+		if again ~= y and not rt_bad then rt_bad = "encode(decode(" .. y .. ")) = " .. again end
+	end
+	check("round-trips: extract(encode(ns)) == ns and encode(extract(y)) == y", not rt_bad, rt_bad)
+	check("UUIDV7_DECIMAL_MAX covers the longest extract",
+		#z_extract("ffffffffffff7fffbfffffffffffffff", true) == H.UUIDV7_DECIMAL_MAX)
+end
+
+-- ---------- 4. explicit-timestamp parsing ----------
+do
+	local corpus = { "", "-", "--1", "0", "-0", "00", "007", "+5", " 5", "5 ", "1e5", "0x10", "1.0", "\0", "5\0",
+		"9223372036854775807", "9223372036854775808", "09223372036854775807", "-9223372036854775808",
+		"99999999999999999999", "18446744073709551616", "1700000000000000000", "-1", "-1000001" }
+	local alphabet = "0123456789-+ ax\0"
+	for _ = 1, 50000 * SCALE do
+		local t = {}
+		local len = randint(24)
+		for i = 1, len do
+			if randint(5) == 0 then local p = 1 + randint(#alphabet); t[i] = alphabet:sub(p, p)
+			else t[i] = tostring(randint(10)) end
+		end
+		corpus[#corpus + 1] = table.concat(t)
+	end
+	local mismatch
+	for _, s in ipairs(corpus) do
+		local lv, lerr = core.parse_static(s)
+		local zv, zrc = z_parse(s)
+		local same
+		if lv then same = zv == lv
+		elseif lerr then same = zrc == H.UUIDV7_ERR_RANGE
+		else same = zrc == H.UUIDV7_ERR_INVALID end
+		if not same and not mismatch then
+			mismatch = ("%q: lua=%s/%s zig=%s/%s"):format(s, tostring(lv), tostring(lerr), tostring(zv), tostring(zrc))
+		end
+	end
+	check(("timestamp parsing agrees (%d strings)"):format(#corpus), not mismatch, mismatch)
+
+	local ms_bad
+	local ms_cases = { -1LL, 0LL, 1LL, 9223372036854LL, 9223372036855LL, INT64_MAX }
+	for _ = 1, 20000 * SCALE do ms_cases[#ms_cases + 1] = ffi.cast("int64_t", rand64()) % 20000000000000LL end
+	for _, ms in ipairs(ms_cases) do
+		local lv = core.ms_to_ns(ms)
+		local rc = Z.uuidv7_ms_to_ns(ms, i64_out)
+		local ok = lv and (rc == H.UUIDV7_OK and i64_out[0] == lv) or (not lv and rc == H.UUIDV7_ERR_RANGE)
+		if not ok and not ms_bad then ms_bad = dec(ms) end
+	end
+	check(("ms_to_ns agrees (%d values)"):format(#ms_cases), not ms_bad, ms_bad)
+
+	local ft_bad
+	local fts = { 0ULL, 116444736000000000ULL, 116444736000000001ULL, 133444736000000000ULL, 0xFFFFFFFFFFFFFFFFULL }
+	for _ = 1, 20000 * SCALE do fts[#fts + 1] = rand64() end
+	for _, ft in ipairs(fts) do
+		if Z.uuidv7_filetime_to_unix_ns(ft) ~= core.filetime_to_unix_ns(ft) and not ft_bad then ft_bad = dec(ft) end
+	end
+	check(("FILETIME conversion agrees (%d values)"):format(#fts), not ft_bad, ft_bad)
+end
+
+-- ---------- 5. sorted sweep over Zig-generated values (oracle-free ordering check) ----------
+do
+	local stored, out = ffi.new("uuidv7_state"), ffi.new("uuidv7_state")
+	local kind, used = ffi.new("uint8_t[1]"), ffi.new("uint8_t[1]")
+	local prev, bad = "", nil
+	local t = 1700000000000000000LL
+	for i = 1, 100000 * SCALE do
+		t = t + randint(400000) - 100000
+		if i % 9973 == 0 then t = t - 50000000 end
+		local now = t - t % 100LL  -- Windows-like 100 ns ticks
+		assert(Z.uuidv7_advance(i > 1 and stored or nil, now, 0, rand64(), out, kind, used) == H.UUIDV7_OK)
+		stored.nanotime, stored.counter = out.nanotime, out.counter
+		local s = z_format(out.nanotime, out.counter, false)
+		if not (s > prev) and not bad then bad = ("#%d %s then %s"):format(i, prev, s) end
+		prev = s
+	end
+	check(("Zig sequence is strictly increasing (%d values, 100 ns ticks, backward steps)"):format(100000 * SCALE), not bad, bad)
+end
+
+-- ---------- 6. ABI edge contracts ----------
+do
+	check("encode refuses a short buffer", Z.uuidv7_encode(0, 0, bytes16, 15) == H.UUIDV7_ERR_BUFFER)
+	check("encode refuses NULL output", Z.uuidv7_encode(0, 0, nil, 16) == H.UUIDV7_ERR_NULL)
+	check("format refuses 15 input bytes", Z.uuidv7_format(bytes16, 15, 0, text_out, 64, len_out) == H.UUIDV7_ERR_INVALID)
+	check("format refuses capacity 35 for hyphenated", Z.uuidv7_format(bytes16, 16, 1, text_out, 35, len_out) == H.UUIDV7_ERR_BUFFER)
+	check("format accepts capacity 32 for compact", Z.uuidv7_format(bytes16, 16, 0, text_out, 32, len_out) == H.UUIDV7_OK and len_out[0] == 32)
+	check("extract refuses capacity 20 for a 21-digit result",
+		Z.uuidv7_extract("ffffffffffff7fffbfffffffffffffff", 32, 1, text_out, 20, len_out) == H.UUIDV7_ERR_BUFFER)
+	check("extract treats an embedded NUL as malformed",
+		Z.uuidv7_extract("017f22e279b077ff\0fc90c9a45e78a47", 33, 0, text_out, 64, len_out) == H.UUIDV7_ERR_INVALID)
+	check("extract of empty NULL text is malformed", Z.uuidv7_extract(nil, 0, 0, text_out, 64, len_out) == H.UUIDV7_ERR_INVALID)
+	check("parse of empty NULL text is not a number", Z.uuidv7_parse_timestamp(nil, 0, i64_out) == H.UUIDV7_ERR_INVALID)
+	local st = ffi.new("uuidv7_state", { 1700000000000000123LL, 0x3FFFFFFFFFFFFFULL })
+	local st2 = ffi.new("uuidv7_state")
+	local rc1 = Z.uuidv7_state_encode(st, text_out, 64, len_out)
+	local txt = ffi.string(text_out, len_out[0])
+	local rc2 = Z.uuidv7_state_decode(txt, #txt, st2)
+	check("state codec round-trips through the ABI",
+		rc1 == H.UUIDV7_OK and rc2 == H.UUIDV7_OK and txt == "1700000000000000123:18014398509481983"
+		and st2.nanotime == st.nanotime and st2.counter == st.counter, txt)
+	check("state decode refuses junk", Z.uuidv7_state_decode("x", 1, st2) == H.UUIDV7_ERR_INVALID)
+	local vlen = ffi.new("size_t[1]")
+	local v = Z.uuidv7_version(vlen)
+	check("library version matches the LuaJIT core", ffi.string(v, vlen[0]) == core.VERSION, ffi.string(v, vlen[0]))
+end
+
+io.write(("%d/%d differential tests passed\n"):format(tests - fails, tests))
+os.exit(fails == 0 and 0 or 1)

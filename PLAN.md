@@ -10,14 +10,17 @@ Kickoff 2026-10-06: three-OS support, coarse-clock proof, Zig port with LuaJIT a
 - [x] LuaJIT on Windows: GetSystemTimePreciseAsFileTime clock, BCryptGenRandom RNG, LockFileEx counter file in %TEMP% (2026-10-06 17:45 EDT)
 - [x] Windows test run on a real Windows host (LuaJIT + Git Bash); report method: Windows 10 x86_64 via SSH + Git Bash, static mingw LuaJIT (2026-10-06 17:45 EDT)
 - [x] macOS test run on a real Mac: macOS 26.7.1 arm64 via SSH (2026-10-06 17:46 EDT)
-- [ ] Zig core (pure, no I/O): advance, encode, format, parse, extract
-- [ ] C FFI with pointer+length buffers; header
-- [ ] C CLI over the FFI: clock, RNG, counter state, flags matching LuaJIT CLI
-- [ ] `./build` with cross-compilation for the 5 target triples
-- [ ] Differential suite (LuaJIT oracle via FFI load of the Zig library): encode bytes, extract edges + large sample, sorted sweep
-- [ ] CLI differential: hyphen/compact/case, refusals, exit codes
+- [x] Zig core (pure, no I/O): advance, encode, format, parse, extract (2026-10-06 18:06 EDT)
+- [x] C FFI with pointer+length buffers; header (2026-10-06 18:06 EDT)
+- [x] C CLI over the FFI: clock, RNG, counter state, flags matching LuaJIT CLI (2026-10-06 18:06 EDT)
+- [x] `./build` with cross-compilation for the 5 target triples (2026-10-06 18:06 EDT)
+- [x] Differential suite (LuaJIT oracle via FFI load of the Zig library): encode bytes, extract edges + large sample, sorted sweep (2026-10-06 18:06 EDT)
+- [x] CLI differential: hyphen/compact/case, refusals, exit codes (2026-10-06 18:06 EDT)
 - [ ] Mechatron Prime CI targets manifest + badge
 - [ ] README: platforms, verification methods, Zig CLI
 - [ ] Note wasm32-freestanding feasibility for the Zig core (no integration)
 - [ ] Reproducible Windows test toolchain: flake output for a static mingw LuaJIT (currently built ad hoc with an override)
 - [ ] Windows aarch64 verification (no ARM64 Windows host known; ask)
+- [x] Fix oracle: --extract-timestamp-ns wrapped modulo 2^64; explicit timestamps outside [0, INT64_MAX] now refused (CLI + daemon) (2026-10-06 17:49 EDT)
+- [ ] Ask BDFN: keep the inherited CLI quirks that uuidv7z mirrors? (`uuidv7 - foo` ignores `foo`; `uuidv7 123 --hyphen` ignores `--hyphen`; `uuidv7 123 456` uses 123)
+- [ ] Linux aarch64 runtime verification (cross-compiled only so far)

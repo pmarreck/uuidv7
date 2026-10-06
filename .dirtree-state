@@ -3,7 +3,17 @@ ver=1.2
 annotate=[
 	INTENT.md = canonical project purpose (provisional)
 	PLAN.md = checkbox work plan
+	build = host build/publish of uuidv7z (nix default, --backend=direct, --debug, --test)
+	build-all = cross-compile 5 targets + wasm32 and verify file headers
+	build.zig = Zig build graph: static/shared C ABI lib, uuidv7z CLI, unit tests, wasm32 core
+	c/uuidv7z.c = C CLI: all I/O (clock, OS RNG, locked state file) via the C ABI only
+	include/uuidv7.h = public C ABI header
 	intents/three_os_and_zig_port.md = accepted direction: 3 OSes + Zig port with LuaJIT oracle, done criteria
+	src/ffi.zig = C ABI exports (pointer+length) over the pure core
+	src/uuidv7.zig = pure Zig core: advance (monotonic counter), encode, format, extract, parseTimestamp, state codec
+	src/uuidv7_test.zig = Zig core unit tests incl. sorted sweep
 	tests/uuidv7_clock_test = injected-clock tests: monotonic+unique at 1ms/100ns/1ns ticks, backward steps, frozen clock, counter overflow
+	tests/uuidv7_differential_test = LuaJIT oracle vs Zig C ABI: encode, advance, extract, parse, round-trips, sorted sweep
 	tests/uuidv7_windows_test = Windows-only CLI contract: daemon refusal, secure RNG, LockFileEx counter ordering across processes
+	tests/uuidv7z_cli_test = CLI differential: uuidv7z vs LuaJIT uuidv7 (exit codes, stdout, stderr, ordering)
 ]
