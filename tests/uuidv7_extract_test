@@ -108,6 +108,18 @@ assert_eq "env=true silences" "$([[ -z "$et" ]] && echo yes || echo no)" "yes"
 ms_err=$(uuidv7 --extract-timestamp-ms "$u" 2>&1 >/dev/null)
 assert_eq "ms never warns" "$([[ -z "$ms_err" ]] && echo yes || echo no)" "yes"
 
+# Exact beyond 64 bits: the max 48-bit ms with all 20 sub-ms bits set is
+# (2^48-1)*1e6 + 1048575 = 281474976710656048575 ns, which exceeds 2^64.
+assert_eq "extract-ns max 48-bit ms (exceeds 2^64)" \
+	"$(uuidv7 --extract-timestamp-ns --mute-warning ffffffff-ffff-7fff-bfff-ffffffffffff)" "281474976710656048575"
+assert_eq "extract-ms max 48-bit ms" \
+	"$(uuidv7 --extract-timestamp-ms ffffffff-ffff-7fff-bfff-ffffffffffff)" "281474976710655"
+# Sub-ms bits >= 1e6 (possible only in foreign UUIDs) carry into the ms digits.
+assert_eq "extract-ns ms=0 with 20 sub-ms bits set" \
+	"$(uuidv7 --extract-timestamp-ns --mute-warning 00000000-0000-7fff-bfff-ffffffffffff)" "1048575"
+assert_eq "extract-ns of zero uuid" \
+	"$(uuidv7 --extract-timestamp-ns --mute-warning 00000000-0000-7000-8000-000000000000)" "0"
+
 if (( fails > 0 )); then
 	echo "$fails of $tests extract tests failed!" >&2
 else

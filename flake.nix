@@ -15,6 +15,8 @@
         runtimeTools = [ pkgs.luajit ];
         # Tools the test suites shell out to (jq validates the JSONL log).
         testTools = with pkgs; [ bashInteractive coreutils gnugrep jq ];
+        # Zig 0.16 builds the pure core, its C ABI library and the uuidv7z C CLI.
+        zig = pkgs.zig_0_16;
 
         uuidv7 = pkgs.stdenv.mkDerivation {
           pname = "uuidv7";
@@ -66,7 +68,7 @@
           '';
 
         devShells.default = pkgs.mkShell {
-          packages = runtimeTools ++ testTools;
+          packages = runtimeTools ++ testTools ++ [ zig pkgs.file ];
         };
       });
 }

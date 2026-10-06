@@ -287,6 +287,23 @@ else
 	echo "✓ Rapid static timestamp UUIDs are unique (counter provides differentiation)"
 fi
 
+# Explicit timestamps must be representable: 0 <= ns <= INT64_MAX. A UUIDv7 cannot
+# encode pre-epoch time, and silently saturating an overflow would mint a wrong time.
+for bad in -1 -1000001 9223372036854775808 99999999999999999999; do
+	for flag in "" --hyphen; do
+		out=$(uuidv7 $flag "$bad" 2>"$TMPDIR/err"); rc=$?
+		if [ "$rc" -eq 1 ] && [ -z "$out" ] && grep -q 'timestamp out of range' "$TMPDIR/err"; then
+			((tests++)); echo "✓ static timestamp $bad ${flag:-(compact)} is refused"
+		else
+			((tests++)); ((fails++)); echo "✗ static timestamp $bad ${flag:-(compact)}: rc=$rc out=$out" >&2
+		fi
+	done
+done
+edge=$(uuidv7 9223372036854775807)
+assert "[ '$(uuidv7 --extract-timestamp-ms "$edge")' = 9223372036854 ]" && echo "✓ INT64_MAX static timestamp is accepted"
+edge0=$(uuidv7 0)
+assert "[ '${edge0:0:12}' = 000000000000 ]" && echo "✓ zero static timestamp is accepted"
+
 # Summary
 if [ $fails -eq 0 ]; then
 	echo "All $tests tests passed!"

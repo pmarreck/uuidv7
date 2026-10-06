@@ -93,6 +93,12 @@ local function body()
 	-- a malformed / int64-overflowing request must NOT crash the daemon
 	req("tm99999999999999"); req("c1tm99999999999999*")
 	ok("daemon survives a malformed request", req("PING") == "OK\n")
+	-- explicit times beyond INT64_MAX ns are refused, never wrapped or saturated
+	ok("tn > INT64_MAX -> ERR out of range", req("tn9223372036854775808*"):match("out of range") ~= nil,
+		req("tn9223372036854775808*"))
+	ok("tm overflowing int64 ns (wraps positive) -> ERR out of range", req("tm20000000000000*"):match("out of range") ~= nil,
+		req("tm20000000000000*"))
+	ok("tm at the int64 ns limit -> ok", #lines_of(req("c1tm9223372036854*")) == 1)
 
 	-- caps & errors
 	ok("c1001 -> ERR too many", req("c1001"):match("too many") ~= nil, req("c1001"))

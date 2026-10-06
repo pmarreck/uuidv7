@@ -178,7 +178,8 @@ local function parse_request(line)
 			local d = line:match("^(%d+)", i + 2)
 			if not d then return { kind = "err", msg = "time needs digits" } end
 			local v = core.parse_static(d)
-			if unit == "m" then v = v * 1000000LL end
+			if v and unit == "m" then v = core.ms_to_ns(v) end
+			if not v then return { kind = "err", msg = "timestamp out of range" } end
 			time_ns = v; time_seen = true; i = i + 2 + #d
 		elseif c == "R" then
 			local d = line:match("^(%d+)", i + 1)

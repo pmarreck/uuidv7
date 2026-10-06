@@ -137,11 +137,28 @@ local NS_PER_MS = 1000000LL
 
 local function num_to_dec(v) return (tostring(v):gsub("[uUlL]+$", "")) end
 
+-- Parse an explicit epoch-nanosecond timestamp. Returns int64 for decimal input in
+-- [0, INT64_MAX]; nil, "timestamp out of range" for other decimal integers (UUIDv7
+-- cannot encode pre-epoch time, and saturating an overflow would mint a wrong
+-- time); nil alone when the string is not a decimal integer at all.
+local INT64_MAX_DEC = "9223372036854775807"
 local function parse_static(s)
 	if type(s) ~= "string" or not s:match("^%-?%d+$") then return nil end
-	return strtoll(s, nil, 10)
+	local neg, digits = s:match("^(%-?)0*(%d-)$")
+	if digits == "" then return 0LL end
+	if neg == "-" or #digits > #INT64_MAX_DEC or (#digits == #INT64_MAX_DEC and digits > INT64_MAX_DEC) then
+		return nil, "timestamp out of range"
+	end
+	return strtoll(digits, nil, 10)
 end
 M.parse_static = parse_static
+
+-- Milliseconds (int64) to nanoseconds, refusing values whose product overflows int64.
+local MAX_MS = 9223372036854LL
+function M.ms_to_ns(ms)
+	if ms < 0LL or ms > MAX_MS then return nil, "timestamp out of range" end
+	return ms * NS_PER_MS
+end
 
 -- 64 big-endian bits from the OS CSPRNG; the default counter-seed source.
 local function os_random_u64()
@@ -401,8 +418,12 @@ local function extract_timestamp(uuid, unit)
 	local ns_hi12 = bit.bor(bit.lshift(bit.band(b[7], 0x0F), 8), b[8])
 	local ns_lo8  = bit.bor(bit.lshift(bit.band(b[9], 0x3F), 2), bit.rshift(b[10], 6))
 	local ns_in_ms = bit.bor(bit.lshift(ns_hi12, 8), ns_lo8)
-	local ns = ms * ffi.cast("uint64_t", NS_PER_MS) + ffi.cast("uint64_t", ns_in_ms)
-	return num_to_dec(ns)
+	-- ms*1e6 + ns_in_ms can exceed 2^64 (max 48-bit ms), so build the decimal
+	-- exactly: ns_in_ms (20 bits) may carry one into the millisecond digits.
+	local carry, rem = math.floor(ns_in_ms / 1000000), ns_in_ms % 1000000
+	local ms_c = ms + ffi.cast("uint64_t", carry)
+	if ms_c == 0ULL then return tostring(rem) end
+	return num_to_dec(ms_c) .. string.format("%06d", rem)
 end
 M.extract_timestamp = extract_timestamp
 

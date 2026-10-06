@@ -142,8 +142,15 @@ local function main(args)
 	-- Parse static timestamp if provided (last argument that's a number)
 	local static_nanotime = nil
 	local last_arg = args[#args]
-	if last_arg and parse_static(last_arg) then
-		static_nanotime = parse_static(last_arg)
+	local function refuse_range(s)
+		io.stderr:write("uuidv7: timestamp out of range: " .. s ..
+			" (expected 0 to 9223372036854775807 nanoseconds since the Unix epoch)\n")
+		os.exit(1)
+	end
+	if last_arg then
+		local v, perr = parse_static(last_arg)
+		if perr then refuse_range(last_arg) end
+		static_nanotime = v
 	end
 	
 	if arg1 == "-h" or arg1 == "--help" then
@@ -164,7 +171,8 @@ local function main(args)
 	elseif arg1 == "--hyphen" or arg1 == "--hyphens" or arg1 == "-" then
 		local uuid = generate_uuidv7(static_nanotime)
 		print(format_uuid(uuid, true))
-	elseif parse_static(arg1) then
+	elseif arg1:match("^%-?%d+$") then
+		if select(2, parse_static(arg1)) then refuse_range(arg1) end
 		-- First argument is a number, treat as static timestamp
 		local uuid = generate_uuidv7(parse_static(arg1))
 		print(format_uuid(uuid, false))

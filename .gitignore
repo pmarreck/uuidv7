@@ -4,3 +4,11 @@ result
 result-*
 .direnv
 inbox/
+zig-out
+.zig-cache
+zig-pkg
+.nix-out
+/bin/linux
+/bin/macos
+/bin/windows
+ZIG_RECENT_API_CHANGES.md
