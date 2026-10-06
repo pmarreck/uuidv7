@@ -16,7 +16,6 @@ ffi.cdef[[
 	int getentropy(void *buf, size_t buflen);
 	typedef int mode_t;
 	typedef long off_t;
-	typedef unsigned long size_t;
 	typedef long ssize_t;
 	int open(const char *pathname, int flags, ...);
 	int close(int fd);
@@ -47,9 +46,44 @@ local M = {}
 M.VERSION = "0.2.0"
 
 local is_macos = jit.os == "OSX"
+local is_windows = jit.os == "Windows"
+M.is_windows = is_windows
+
+if is_windows then
+	ffi.cdef[[
+		typedef struct { uint32_t dwLowDateTime; uint32_t dwHighDateTime; } uuidv7_FILETIME;
+		void GetSystemTimePreciseAsFileTime(uuidv7_FILETIME *ft);
+		int32_t BCryptGenRandom(void *alg, uint8_t *buf, uint32_t len, uint32_t flags);
+		typedef struct { uintptr_t Internal; uintptr_t InternalHigh; uint32_t Offset; uint32_t OffsetHigh; void *hEvent; } uuidv7_OVERLAPPED;
+		void *CreateFileA(const char *name, uint32_t access, uint32_t share, void *sa, uint32_t disposition, uint32_t flags, void *tmpl);
+		int LockFileEx(void *h, uint32_t flags, uint32_t reserved, uint32_t lo, uint32_t hi, uuidv7_OVERLAPPED *ov);
+		int UnlockFileEx(void *h, uint32_t reserved, uint32_t lo, uint32_t hi, uuidv7_OVERLAPPED *ov);
+		int ReadFile(void *h, void *buf, uint32_t n, uint32_t *got, void *ov);
+		int WriteFile(void *h, const void *buf, uint32_t n, uint32_t *put, void *ov);
+		uint32_t SetFilePointer(void *h, int32_t dist, int32_t *dist_hi, uint32_t method);
+		int SetEndOfFile(void *h);
+		int CloseHandle(void *h);
+		long long _strtoi64(const char *nptr, char **endptr, int base);
+	]]
+end
+-- msvcrt.dll has no strtoll; _strtoi64 has the same saturating semantics.
+local strtoll = is_windows and C._strtoi64 or C.strtoll
+
+-- Windows FILETIME (100 ns ticks since 1601-01-01 UTC) to Unix epoch nanoseconds.
+local FILETIME_UNIX_EPOCH = 116444736000000000LL
+local function filetime_to_unix_ns(ft)
+	return (ffi.cast("int64_t", ft) - FILETIME_UNIX_EPOCH) * 100LL
+end
+M.filetime_to_unix_ns = filetime_to_unix_ns
 
 -- Current time in nanoseconds since epoch (true ns on Linux and macOS >= 10.12).
 local function get_nanotime()
+	if is_windows then
+		-- 100 ns resolution; ordering below that comes from the counter.
+		local ft = ffi.new("uuidv7_FILETIME")
+		C.GetSystemTimePreciseAsFileTime(ft)
+		return filetime_to_unix_ns(bit.bor(bit.lshift(ffi.cast("uint64_t", ft.dwHighDateTime), 32), ft.dwLowDateTime))
+	end
 	local ts = ffi.new("struct timespec")
 	if C.clock_gettime(C.CLOCK_REALTIME, ts) == 0 then
 		return ffi.cast("int64_t", ts.tv_sec) * 1000000000LL + ffi.cast("int64_t", ts.tv_nsec)
@@ -66,7 +100,13 @@ M.get_nanotime = get_nanotime
 -- with a loud, mute-able fallback to non-secure math.random.
 local function get_random_bytes(count)
 	local buf = ffi.new("uint8_t[?]", count)
-	if not is_macos then
+	if is_windows then
+		local BCRYPT_USE_SYSTEM_PREFERRED_RNG = 2
+		local ok, good = pcall(function()
+			return ffi.load("bcrypt").BCryptGenRandom(nil, buf, count, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0
+		end)
+		if ok and good then return buf end
+	elseif not is_macos then
 		local ok = pcall(function() return C.getrandom(buf, count, 0) == count end)
 		if ok then return buf end
 	end
@@ -99,7 +139,7 @@ local function num_to_dec(v) return (tostring(v):gsub("[uUlL]+$", "")) end
 
 local function parse_static(s)
 	if type(s) ~= "string" or not s:match("^%-?%d+$") then return nil end
-	return C.strtoll(s, nil, 10)
+	return strtoll(s, nil, 10)
 end
 M.parse_static = parse_static
 
@@ -177,8 +217,8 @@ function FsCounter:get_next(current_nt, is_static, random_u64)
 	if n > 0 then
 		local s_nt, s_ctr = ffi.string(buf, n):match("(%-?%d+):(%d+)")
 		if s_nt and s_ctr then
-			stored_nt = C.strtoll(s_nt, nil, 10)
-			stored_ctr = ffi.cast("uint64_t", C.strtoll(s_ctr, nil, 10))
+			stored_nt = strtoll(s_nt, nil, 10)
+			stored_ctr = ffi.cast("uint64_t", strtoll(s_ctr, nil, 10))
 		end
 	end
 	local eff, ctr, kind = advance(stored_nt, stored_ctr, current_nt, is_static, random_u64)
@@ -217,10 +257,48 @@ function SysVCounter:get_next(current_nt, is_static, random_u64)
 	return eff, ctr, kind
 end
 
+-- Windows: a LockFileEx-locked state file, same "ns:counter" text format as FsCounter.
+local WinCounter = {}
+WinCounter.__index = WinCounter
+function WinCounter:new()
+	local dir = os.getenv("TMPDIR") or os.getenv("TEMP") or os.getenv("TMP") or "."
+	return setmetatable({ filepath = dir:gsub("[/\\]+$", "") .. "\\uuidv7-sequence", _nt = nil, _ctr = nil }, self)
+end
+function WinCounter:get_next(current_nt, is_static, random_u64)
+	local GENERIC_RW, SHARE_RW, OPEN_ALWAYS, LOCKFILE_EXCLUSIVE = 0xC0000000, 3, 4, 2
+	local h = C.CreateFileA(self.filepath, GENERIC_RW, SHARE_RW, nil, OPEN_ALWAYS, 0x80, nil)
+	if ffi.cast("intptr_t", h) == -1 then
+		self._nt, self._ctr = advance(self._nt, self._ctr, current_nt, is_static, random_u64)
+		return self._nt, self._ctr, "new"
+	end
+	local ov = ffi.new("uuidv7_OVERLAPPED")
+	C.LockFileEx(h, LOCKFILE_EXCLUSIVE, 0, 0xFFFFFFFF, 0xFFFFFFFF, ov)
+	local buf = ffi.new("char[?]", 96)
+	local got = ffi.new("uint32_t[1]")
+	C.SetFilePointer(h, 0, nil, 0)
+	local stored_nt, stored_ctr
+	if C.ReadFile(h, buf, 95, got, nil) ~= 0 and got[0] > 0 then
+		local s_nt, s_ctr = ffi.string(buf, got[0]):match("(%-?%d+):(%d+)")
+		if s_nt and s_ctr then
+			stored_nt = strtoll(s_nt, nil, 10)
+			stored_ctr = ffi.cast("uint64_t", strtoll(s_ctr, nil, 10))
+		end
+	end
+	local eff, ctr, kind = advance(stored_nt, stored_ctr, current_nt, is_static, random_u64)
+	local out = num_to_dec(eff) .. ":" .. num_to_dec(ctr)
+	C.SetFilePointer(h, 0, nil, 0)
+	C.WriteFile(h, out, #out, got, nil)
+	C.SetEndOfFile(h)
+	C.UnlockFileEx(h, 0, 0xFFFFFFFF, 0xFFFFFFFF, ov)
+	C.CloseHandle(h)
+	return eff, ctr, kind
+end
+
 function M.new_counter(backend)
 	if backend == "auto" or backend == nil then
-		backend = is_macos and "fs" or "sysv"
+		backend = is_windows and "win" or (is_macos and "fs" or "sysv")
 	end
+	if backend == "win" then return WinCounter:new() end
 	if backend == "memory" then return MemoryCounter:new()
 	elseif backend == "fs" then return FsCounter:new()
 	elseif backend == "sysv" then return SysVCounter:new()

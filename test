@@ -5,14 +5,22 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PATH="$here/bin:$PATH"
 export LUA_PATH="$here/lib/?.lua;;"
 export UUIDV7_TEST_FILE="$here/tests/uuidv7_test"
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) windows=1 ;; *) windows=0 ;; esac
 rc=0
 "$here/tests/uuidv7_json_test"   || rc=$?   # mini JSON writer (+ escaping)
 "$here/tests/uuidv7_test"        || rc=$?   # core generator
 "$here/tests/uuidv7_layout_test" || rc=$?   # RFC bit-layout contract
 "$here/tests/uuidv7_clock_test"  || rc=$?   # injected coarse/backward clock ordering
-"$here/tests/uuidv7_daemon_test" || rc=$?   # UDS daemon (black-box)
 "$here/tests/uuidv7_extract_test" || rc=$?   # timestamp extraction round-trip
-"$here/tests/uuidv7_fallback_test" || rc=$?   # daemon retry / no-silent-fallback policy
-"$here/tests/uuidv7_load_test"    || rc=$?   # concurrency invariants under load (no perf gating)
-"$here/tests/uuidv7_fuzz_test"    || rc=$?   # hostile/malformed protocol input (robustness)
+"$here/tests/uuidv7_windows_test" || rc=$?   # Windows CLI contract (n/a elsewhere)
+if [ "$windows" -eq 1 ]; then
+	# The daemon is Unix-only by design (Unix-domain socket, poll(2), re-exec);
+	# uuidv7_windows_test asserts that --daemon and --api refuse on Windows.
+	echo "n/a on Windows (no daemon by design): uuidv7_daemon_test uuidv7_fallback_test uuidv7_load_test uuidv7_fuzz_test"
+else
+	"$here/tests/uuidv7_daemon_test" || rc=$?   # UDS daemon (black-box)
+	"$here/tests/uuidv7_fallback_test" || rc=$?   # daemon retry / no-silent-fallback policy
+	"$here/tests/uuidv7_load_test"    || rc=$?   # concurrency invariants under load (no perf gating)
+	"$here/tests/uuidv7_fuzz_test"    || rc=$?   # hostile/malformed protocol input (robustness)
+fi
 exit "$rc"

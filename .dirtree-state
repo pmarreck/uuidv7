@@ -1,0 +1,9 @@
+# Dirtree: Stateful directory trees in the CLI for humans and LLMs. https://github.com/pmarreck/dirtree
+ver=1.2
+annotate=[
+	INTENT.md = canonical project purpose (provisional)
+	PLAN.md = checkbox work plan
+	intents/three_os_and_zig_port.md = accepted direction: 3 OSes + Zig port with LuaJIT oracle, done criteria
+	tests/uuidv7_clock_test = injected-clock tests: monotonic+unique at 1ms/100ns/1ns ticks, backward steps, frozen clock, counter overflow
+	tests/uuidv7_windows_test = Windows-only CLI contract: daemon refusal, secure RNG, LockFileEx counter ordering across processes
+]

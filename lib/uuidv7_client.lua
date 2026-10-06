@@ -185,6 +185,7 @@ end
 function M.try_daemon(args, opts)
 	opts = opts or {}
 	if os.getenv("UUIDV7_NO_DAEMON") then return "pass" end
+	if core.is_windows then return "pass" end   -- no daemon on Windows by design
 	local hyphen, static = false, false
 	for _, a in ipairs(args) do
 		if a == "-" or a == "--hyphen" or a == "--hyphens" then hyphen = true

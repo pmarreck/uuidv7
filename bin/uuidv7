@@ -2,7 +2,7 @@
 
 -- Generation lives in the shared core (single source of truth for the bit layout).
 -- LuaJIT seeds package.path from $LUA_PATH; add fallbacks for repo + installed use.
-local _self = (arg and arg[0] or ""):match("^(.*)/[^/]+$") or "."
+local _self = (arg and arg[0] or ""):match("^(.*)[/\\][^/\\]+$") or "."
 package.path = table.concat({
 	_self .. "/?.lua",
 	_self .. "/../lib/?.lua",
@@ -72,6 +72,14 @@ end
 
 -- Main
 local function main(args)
+	if core.is_windows and (args[1] == "--daemon" or args[1] == "--api"
+		or args[1] == "--raw" or args[1] == "--socket-api") then
+		-- The daemon needs Unix-domain sockets, poll(2) and re-exec; Windows uses
+		-- local generation with a LockFileEx-locked counter file instead.
+		io.stderr:write("uuidv7: " .. args[1] .. " is not supported on Windows " ..
+			"(the daemon is Unix-only; plain generation works locally)\n")
+		os.exit(1)
+	end
 	if args[1] == "--daemon" then
 		require("uuidv7_daemon").run({ arg0 = arg and arg[0] })
 		return

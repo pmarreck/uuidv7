@@ -54,21 +54,13 @@
             cp -r ${./.} work
             chmod -R u+w work
             cd work
-            patchShebangs bin tests
+            patchShebangs bin tests test
             export HOME="$TMPDIR"
             export PATH="$PWD/bin:$PATH"
             export LUA_PATH="$PWD/lib/?.lua;;"
             export UUIDV7_TEST_FILE="$PWD/tests/uuidv7_test"
             export UUIDV7_SILENCE_INSECURE_RANDOM=1
-            luajit tests/uuidv7_json_test
-            bash   tests/uuidv7_test
-            bash   tests/uuidv7_layout_test
-            luajit tests/uuidv7_clock_test     # injected coarse/backward clock ordering
-            luajit tests/uuidv7_daemon_test
-            bash   tests/uuidv7_extract_test
-            luajit tests/uuidv7_fallback_test
-            bash   tests/uuidv7_load_test    # concurrency invariants under load
-            luajit tests/uuidv7_fuzz_test    # hostile/malformed protocol input
+            bash ./test   # the single complete entry point (every suite)
             luajit bench/uuidv7_bench 50000   # validates the bench runs + its correctness check on Linux
             touch $out
           '';

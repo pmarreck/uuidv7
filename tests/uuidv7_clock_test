@@ -106,6 +106,17 @@ do
 		eff == START and kind == "new" and ctr == bit.lshift(1ULL, 53) - 1ULL, tostring(ctr))
 end
 
+-- Windows FILETIME (100 ns ticks since 1601-01-01 UTC) -> Unix epoch nanoseconds.
+do
+	local f = core.filetime_to_unix_ns
+	ok("FILETIME of the Unix epoch -> 0 ns", f(116444736000000000ULL) == 0LL, tostring(f(116444736000000000ULL)))
+	ok("FILETIME one tick after the epoch -> 100 ns", f(116444736000000001ULL) == 100LL)
+	-- 2023-11-14T22:13:20Z = 1700000000 s; FILETIME = (1700000000 + 11644473600) * 1e7.
+	ok("FILETIME 2023-11-14T22:13:20Z -> 1700000000 s in ns",
+		f(133444736000000000ULL) == 1700000000000000000LL, tostring(f(133444736000000000ULL)))
+	ok("FILETIME result type is int64", ffi.istype("int64_t", f(116444736000000000ULL)))
+end
+
 -- Without injection, the default generator path is unchanged.
 do
 	local b = core.generate_bytes(core.new_counter("memory"), START)
