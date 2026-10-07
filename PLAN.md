@@ -22,5 +22,8 @@ Kickoff 2026-10-06: three-OS support, coarse-clock proof, Zig port with LuaJIT a
 - [ ] Reproducible Windows test toolchain: flake output for a static mingw LuaJIT (currently built ad hoc with an override)
 - [ ] Windows aarch64 verification (no ARM64 Windows host known; ask)
 - [x] Fix oracle: --extract-timestamp-ns wrapped modulo 2^64; explicit timestamps outside [0, INT64_MAX] now refused (CLI + daemon) (2026-10-06 17:49 EDT)
-- [ ] Ask BDFN: keep the inherited CLI quirks that uuidv7z mirrors? (`uuidv7 - foo` ignores `foo`; `uuidv7 123 --hyphen` ignores `--hyphen`; `uuidv7 123 456` uses 123)
+- [x] BDFN chose to fix the inherited CLI quirks (`uuidv7 - foo` ignores `foo`; `uuidv7 123 --hyphen` ignores `--hyphen`; `uuidv7 123 456` uses 123) (2026-10-06 23:08 EDT)
 - [ ] Linux aarch64 on real hardware (QEMU user-mode: Zig unit tests + uuidv7z CLI differential pass, 2026-10-06 18:10 EDT); LuaJIT side not run there
+- [ ] Decide (BDFN): refuse to generate when the OS RNG fails (randomz policy) instead of the warn + insecure-fallback path, in both implementations
+- [ ] If uuidv7z gains batch output or a many-UUIDs-per-process library API: seed randomz's BLAKE3 DRBG once from OS entropy instead of a syscall per new tick (sibling-Zig import; mind fork duplication)
+- [x] Fixed inherited CLI argument quirks in both CLIs: order-independent flags, later timestamp wins, unknown/extra arguments error; -- ends options; extract takes one UUID (2026-10-06 23:13 EDT)

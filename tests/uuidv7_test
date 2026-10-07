@@ -304,6 +304,40 @@ assert "[ '$(uuidv7 --extract-timestamp-ms "$edge")' = 9223372036854 ]" && echo 
 edge0=$(uuidv7 0)
 assert "[ '${edge0:0:12}' = 000000000000 ]" && echo "✓ zero static timestamp is accepted"
 
+# Argument handling: flags in any order, the last timestamp wins, and anything
+# unrecognized is an error rather than silently ignored.
+ts_of() { uuidv7 --extract-timestamp-ns --mute-warning "$1"; }
+argcheck() {  # argcheck <name> <expected-rc> <stdout-regex> <stderr-substring> <args...>
+	local name="$1" want_rc="$2" re="$3" errsub="$4"; shift 4
+	local out rc
+	out=$(uuidv7 "$@" 2>"$TMPDIR/err"); rc=$?
+	((tests++))
+	# An empty <stderr-substring> means stderr must be empty.
+	local err_ok=0
+	if [ -z "$errsub" ]; then [ ! -s "$TMPDIR/err" ] && err_ok=1; else grep -qF -- "$errsub" "$TMPDIR/err" && err_ok=1; fi
+	if [ "$rc" -eq "$want_rc" ] && [[ "$out" =~ $re ]] && [ "$err_ok" -eq 1 ]; then
+		echo "✓ $name"
+	else
+		((fails++)); echo "✗ $name: rc=$rc out=[$out] err=[$(cat "$TMPDIR/err")]" >&2
+	fi
+}
+HY='^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+argcheck "timestamp before --hyphen still hyphenates" 0 "$HY" "" 123 --hyphen
+assert "[ \"\$(ts_of \"\$(uuidv7 123 --hyphen)\")\" = 123 ]" && echo "✓ timestamp before --hyphen is honored"
+assert "[ \"\$(ts_of \"\$(uuidv7 123 456)\")\" = 456 ]" && echo "✓ the last of several timestamps wins"
+assert "[ \"\$(ts_of \"\$(uuidv7 - 5 --hyphens 7)\")\" = 7 ]" && echo "✓ the last timestamp wins across interleaved flags"
+argcheck "stray operand after - is refused" 1 '^$' "unexpected argument 'foo'" - foo
+argcheck "stray operand before a timestamp is refused" 1 '^$' "unexpected argument 'foo'" foo 123
+argcheck "unknown option after a timestamp is refused" 1 '^$' "unknown option '--bogus'" 123 --bogus
+argcheck "unknown option after --hyphen is refused" 1 '^$' "unknown option '-x'" --hyphen -x
+argcheck "--help with a stray operand is refused" 1 '^$' "unexpected argument 'foo'" --help foo
+argcheck "out-of-range timestamp is refused even if overridden" 1 '^$' "timestamp out of range: -1" -1 5
+argcheck "--help after a flag still prints help" 0 'Usage' "" --hyphen --help
+argcheck "-- makes the rest operands" 0 '^[0-9a-f]{32}$' "" -- 123
+argcheck "-- then a non-number is refused" 1 '^$' "unexpected argument '--hyphen'" -- --hyphen
+argcheck "extract refuses a second operand" 1 '^$' "unexpected argument 'extra'" \
+	--extract-timestamp-ms 017f22e279b077ffbfc90c9a45e78a47 extra
+
 # Summary
 if [ $fails -eq 0 ]; then
 	echo "All $tests tests passed!"

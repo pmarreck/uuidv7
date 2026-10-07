@@ -42,7 +42,11 @@ Options:
                               UUIDV7_NS_EXTRACT_OK=1.
 
 Arguments:
-  nanoseconds-from-epoch      Optional static timestamp (testing/backfill)
+  nanoseconds-from-epoch      Optional static timestamp (testing/backfill),
+                              0 to 9223372036854775807
+  Options and the timestamp may appear in any order; if several timestamps are
+  given, the last one wins. After --, every argument is a timestamp. Any other
+  argument is an error.
 
 Daemon:
   `uuidv7 --daemon` serves UUIDv7s over a Unix socket
@@ -104,7 +108,11 @@ local function main(args)
 		local uuid_arg, muted = nil, false
 		for i = 2, #args do
 			if args[i] == "--mute-warning" then muted = true
-			elseif uuid_arg == nil then uuid_arg = args[i] end
+			elseif uuid_arg == nil then uuid_arg = args[i]
+			else
+				io.stderr:write("uuidv7: unexpected argument '" .. args[i] .. "' (" .. args[1] .. " takes one UUID)\n")
+				os.exit(1)
+			end
 		end
 		local val, eerr = core.extract_timestamp(uuid_arg or "", unit)
 		if not val then
@@ -129,35 +137,8 @@ local function main(args)
 		local ok, client = pcall(require, "uuidv7_client")
 		if ok and client.maybe_handle(args) then return end
 	end
-	if #args == 0 then
-		-- Generate UUID without hyphens
-		local uuid = generate_uuidv7()
-		print(format_uuid(uuid, false))
-		return
-	end
-	
-	local arg1 = args[1]
-	local arg2 = args[2]
-	
-	-- Parse static timestamp if provided (last argument that's a number)
-	local static_nanotime = nil
-	local last_arg = args[#args]
-	local function refuse_range(s)
-		io.stderr:write("uuidv7: timestamp out of range: " .. s ..
-			" (expected 0 to 9223372036854775807 nanoseconds since the Unix epoch)\n")
-		os.exit(1)
-	end
-	if last_arg then
-		local v, perr = parse_static(last_arg)
-		if perr then refuse_range(last_arg) end
-		static_nanotime = v
-	end
-	
-	if arg1 == "-h" or arg1 == "--help" then
-		show_help()
-	elseif arg1 == "--about" or arg1 == "-a" then
-		print("Generate RFC 9562 compliant UUIDv7 with nanosecond precision")
-	elseif arg1 == "--test" then
+	-- --test runs the bundled suite (first argument only).
+	if args[1] == "--test" then
 		local self = (arg and arg[0]) or ""
 		local self_dir = self:match("^(.*)/[^/]+$")
 		local candidates = {}
@@ -168,19 +149,37 @@ local function main(args)
 		local found
 		for _, p in ipairs(candidates) do local fh = io.open(p, "r"); if fh then fh:close(); found = p; break end end
 		if found then os.execute("exec " .. found) else io.stderr:write("uuidv7 test file not found\n"); os.exit(1) end
-	elseif arg1 == "--hyphen" or arg1 == "--hyphens" or arg1 == "-" then
-		local uuid = generate_uuidv7(static_nanotime)
-		print(format_uuid(uuid, true))
-	elseif arg1:match("^%-?%d+$") then
-		if select(2, parse_static(arg1)) then refuse_range(arg1) end
-		-- First argument is a number, treat as static timestamp
-		local uuid = generate_uuidv7(parse_static(arg1))
-		print(format_uuid(uuid, false))
-	else
-		-- Unrecognized argument: fail loudly rather than silently generating.
-		io.stderr:write("uuidv7: unknown option '" .. tostring(arg1) .. "'\n" ..
-			"Try 'uuidv7 --help' for usage.\n")
+		return
+	end
+
+	-- Generation arguments, parsed left to right in any order: hyphen flags, an
+	-- explicit timestamp (the last one wins; every one must be in range), and
+	-- help/about (the last one wins). Anything else is an error, even alongside
+	-- help, so a typo is never silently ignored. After "--", all are timestamps.
+	local function usage_error(msg)
+		io.stderr:write("uuidv7: " .. msg .. "\nTry 'uuidv7 --help' for usage.\n")
 		os.exit(1)
+	end
+	local hyphens, static_nanotime, action, operands_only = false, nil, nil, false
+	for _, a in ipairs(args) do
+		local v, perr = parse_static(a)
+		if perr then
+			io.stderr:write("uuidv7: timestamp out of range: " .. a ..
+				" (expected 0 to 9223372036854775807 nanoseconds since the Unix epoch)\n")
+			os.exit(1)
+		elseif v then static_nanotime = v
+		elseif operands_only then usage_error("unexpected argument '" .. a .. "' (expected a nanosecond timestamp)")
+		elseif a == "--" then operands_only = true
+		elseif a == "--hyphen" or a == "--hyphens" or a == "-" then hyphens = true
+		elseif a == "-h" or a == "--help" then action = "help"
+		elseif a == "--about" or a == "-a" then action = "about"
+		elseif a:sub(1, 1) == "-" then usage_error("unknown option '" .. a .. "'")
+		else usage_error("unexpected argument '" .. a .. "' (expected a nanosecond timestamp)")
+		end
+	end
+	if action == "help" then show_help()
+	elseif action == "about" then print("Generate RFC 9562 compliant UUIDv7 with nanosecond precision")
+	else print(format_uuid(generate_uuidv7(static_nanotime), hyphens))
 	end
 end
 

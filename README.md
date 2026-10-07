@@ -41,6 +41,8 @@ remain strictly ordered and unique.
   not rounded through a double), useful for testing/reproducibility. It must be in
   0..9223372036854775807; anything else exits 1 with "timestamp out of range" (a UUIDv7
   cannot encode pre-1970 time, and an overflow must not silently become a wrong time).
+  Options and the timestamp may come in any order (`uuidv7 123 --hyphen`); with several
+  timestamps the last one wins, `--` ends option parsing, and any other argument exits 1.
 - `TMPDIR` — where the cross-process counter state lives (default `/tmp`).
 - `UUIDV7_SILENCE_INSECURE_RANDOM=1` — mute the red stderr warning that fires if no secure
   RNG (`getrandom`/`getentropy`/`/dev/urandom`) is available and it must fall back to the

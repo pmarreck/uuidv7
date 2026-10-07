@@ -71,6 +71,16 @@ for bad in -1 -1000001 9223372036854775808 99999999999999999999; do
 	same - "$bad"
 done
 same --help -1
+# Arguments are order-independent; stray or unknown arguments are errors.
+same - foo
+same foo 123
+same 123 --bogus
+same --hyphen -x
+same --help foo
+same -1 5
+same -- --hyphen
+same --extract-timestamp-ms "$U" extra
+same --extract-timestamp-ns --mute-warning "$U" "$U"
 
 # ---- generation: shape, exit code, clean stderr, exact timestamps ----
 shape() {  # shape <name> <hyphens:0|1> <args...>
@@ -92,12 +102,12 @@ shape hyphens 1 --hyphens
 shape dash 1 -
 shape static 0 1700000000000000123
 shape static-hyphen 1 --hyphen 1700000000000000123
-shape dash-garbage 1 - foo
-shape static-then-flag 0 123 --hyphen
+shape static-then-flag 1 123 --hyphen
+shape double-dash 0 -- 123
 
 # Explicit timestamps are encoded exactly by both (via the oracle's extractor).
 for args in "1700000000000000123" "--hyphen 1645557742000524287" "- 0" "999999" "1000000" \
-	"9223372036854775807" "123 456" "123 --hyphen" "--hyphens 5 7"; do
+	"9223372036854775807" "123 456" "123 --hyphen" "--hyphens 5 7" "- 5 --hyphens 7" "-- 9" "5 -- 8"; do
 	# shellcheck disable=SC2086
 	lu=$("${lua_cli[@]}" $args); zu=$("$zig_cli" $args)
 	lt=$("${lua_cli[@]}" --extract-timestamp-ns --mute-warning "$lu")

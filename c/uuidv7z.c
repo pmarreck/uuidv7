@@ -209,6 +209,14 @@ static _Noreturn void refuse_range(const char *s) {
 	exit(1);
 }
 
+/* Report a bad argument (fmt has one %s) with the usage hint, then exit 1. */
+static _Noreturn void usage_error(const char *fmt, const char *arg) {
+	fputs(PROG ": ", stderr);
+	fprintf(stderr, fmt, arg);
+	fputs("\nTry '" PROG " --help' for usage.\n", stderr);
+	exit(1);
+}
+
 static int is_daemon_flag(const char *a) {
 	return !strcmp(a, "--daemon") || !strcmp(a, "--api") || !strcmp(a, "--raw") || !strcmp(a, "--socket-api");
 }
@@ -234,6 +242,9 @@ static void show_help(void) {
 		"\n"
 		"Arguments:\n"
 		"  nanoseconds-from-epoch      Optional explicit timestamp, 0 to 9223372036854775807\n"
+		"  Options and the timestamp may appear in any order; if several timestamps are\n"
+		"  given, the last one wins. After --, every argument is a timestamp. Any other\n"
+		"  argument is an error.\n"
 		"\n"
 		"Strict ordering across processes comes from an exclusively locked counter file,\n"
 		"$TMPDIR/uuidv7z-sequence (Windows: %TMPDIR%, %TEMP% or %TMP%). The daemon\n"
@@ -263,6 +274,10 @@ static void extract(int argc, char **argv, int unit_ns) {
 	for (int i = 2; i < argc; i++) {
 		if (!strcmp(argv[i], "--mute-warning")) muted = 1;
 		else if (!uuid) uuid = argv[i];
+		else {
+			fprintf(stderr, PROG ": unexpected argument '%s' (%s takes one UUID)\n", argv[i], argv[1]);
+			exit(1);
+		}
 	}
 	if (!uuid) uuid = "";
 	char out[UUIDV7_DECIMAL_MAX];
@@ -295,38 +310,35 @@ int main(int argc, char **argv) {
 		extract(argc, argv, !strcmp(argv[1], "--extract-timestamp-ns"));
 		return 0;
 	}
-	if (argc == 1) {
-		generate(0, 0, 0);
-		return 0;
-	}
-
-	/* The last argument, if an integer, is the explicit timestamp. */
+	/* Generation arguments, parsed left to right in any order: hyphen flags, an
+	 * explicit timestamp (the last one wins; every one must be in range), and
+	 * help/about (the last one wins). Anything else is an error, even alongside
+	 * help, so a typo is never silently ignored. After "--", all are timestamps. */
+	int hyphens = 0, has_static = 0, operands_only = 0;
+	enum { GENERATE, HELP, ABOUT } action = GENERATE;
 	int64_t static_ns = 0;
-	int has_static = 0;
-	const char *last = argv[argc - 1];
-	int rc = uuidv7_parse_timestamp(last, strlen(last), &static_ns);
-	if (rc == UUIDV7_ERR_RANGE) refuse_range(last);
-	has_static = rc == UUIDV7_OK;
-
-	const char *a = argv[1];
-	if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
+	for (int i = 1; i < argc; i++) {
+		const char *a = argv[i];
+		int64_t v;
+		int rc = uuidv7_parse_timestamp(a, strlen(a), &v);
+		if (rc == UUIDV7_ERR_RANGE) refuse_range(a);
+		if (rc == UUIDV7_OK) { static_ns = v; has_static = 1; }
+		else if (operands_only) usage_error("unexpected argument '%s' (expected a nanosecond timestamp)", a);
+		else if (!strcmp(a, "--")) operands_only = 1;
+		else if (!strcmp(a, "--hyphen") || !strcmp(a, "--hyphens") || !strcmp(a, "-")) hyphens = 1;
+		else if (!strcmp(a, "-h") || !strcmp(a, "--help")) action = HELP;
+		else if (!strcmp(a, "--about") || !strcmp(a, "-a")) action = ABOUT;
+		else if (a[0] == '-') usage_error("unknown option '%s'", a);
+		else usage_error("unexpected argument '%s' (expected a nanosecond timestamp)", a);
+	}
+	if (action == HELP) {
 		show_help();
-	} else if (!strcmp(a, "--about") || !strcmp(a, "-a")) {
+	} else if (action == ABOUT) {
 		size_t vl;
 		const char *v = uuidv7_version(&vl);
 		printf(PROG " %.*s Generate RFC 9562 UUIDv7 with nanosecond precision (" ARCH "-" OS ")\n", (int)vl, v);
-	} else if (!strcmp(a, "--hyphen") || !strcmp(a, "--hyphens") || !strcmp(a, "-")) {
-		generate(has_static, static_ns, 1);
 	} else {
-		int64_t first_ns;
-		int frc = uuidv7_parse_timestamp(a, strlen(a), &first_ns);
-		if (frc == UUIDV7_ERR_RANGE) refuse_range(a);
-		if (frc == UUIDV7_OK) {
-			generate(1, first_ns, 0);
-		} else {
-			fprintf(stderr, PROG ": unknown option '%s'\nTry '" PROG " --help' for usage.\n", a);
-			return 1;
-		}
+		generate(has_static, static_ns, hyphens);
 	}
 	return 0;
 }
