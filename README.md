@@ -188,7 +188,14 @@ Put `bin/` on your `PATH`. Requires `luajit` on your `PATH`.
 direnv allow      # or: nix develop
 ./test            # run the suite
 nix flake check   # hermetic CI check (what Mechatron Prime CI runs)
+UUIDV7_WINDOWS_HOST=host ./test-windows   # full ./test on a real Windows machine over SSH
 ```
+
+`./test-windows` builds the flake's static Windows LuaJIT (`packages.x86_64-linux.luajit-windows-x86_64`,
+which a flake check confirms imports only `kernel32.dll` and `msvcrt.dll`) and cross-compiles
+`uuidv7z.exe`/`uuidv7.dll`, copies them with the source tree to the host's `%TEMP%`, and runs
+`./test` there under Git for Windows' Bash. The host needs key-based OpenSSH with `cmd.exe` as
+its default shell.
 
 `./test` is the single entry point. Besides the Zig unit tests (Debug and ReleaseFast)
 and the injected-clock suite, it runs two differential suites with the LuaJIT code as

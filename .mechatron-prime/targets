@@ -4,3 +4,4 @@
 packages.x86_64-linux.default
 packages.x86_64-linux.uuidv7z
 checks.x86_64-linux.uuidv7-test
+checks.x86_64-linux.luajit-windows-x86_64

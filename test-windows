@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Run the complete ./test on a real Windows host over SSH, under Git for
+# Windows' Bash, with a static LuaJIT and cross-compiled uuidv7z.exe/uuidv7.dll.
+# This is a real-hardware run; it does not count a cross-compile as evidence.
+#
+#   UUIDV7_WINDOWS_HOST=myhost ./test-windows
+#
+# Requires: key-based SSH (BatchMode) to a Windows OpenSSH server whose default
+# shell is cmd.exe, Git for Windows at C:\Program Files\Git, and nix + zig here.
+# Uses %TEMP%\uuidv7-verify on the host and replaces it on each run.
+set -u
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$here" || exit 1
+host="${UUIDV7_WINDOWS_HOST:?set UUIDV7_WINDOWS_HOST to the Windows SSH host}"
+remote_dir='uuidv7-verify'
+triple=x86_64-windows-gnu
+
+zig_cmd() { if command -v zig >/dev/null 2>&1; then zig "$@"; else nix develop -c zig "$@"; fi; }
+# Windows OpenSSH prints a post-quantum key-exchange advisory on every connection.
+quiet() { grep -v -e 'post-quantum' -e 'store now, decrypt' -e 'server may need' -e 'pq.html'; }
+
+if ! luajit_out="$(nix build --no-link --print-out-paths "path:$here#luajit-windows-x86_64")"; then
+	echo "test-windows: building the Windows LuaJIT failed" >&2; exit 1
+fi
+if ! zig_cmd build -Doptimize=ReleaseFast -Dtarget="$triple" --prefix "zig-out/$triple/ReleaseFast" >&2; then
+	echo "test-windows: cross-compiling uuidv7z for $triple failed" >&2; exit 1
+fi
+
+stage="$(mktemp -d)"
+trap 'mv "$stage" "$HOME/.Trash/uuidv7-test-windows-$$" 2>/dev/null' EXIT
+git ls-files -co --exclude-standard | tar -cf "$stage/src.tar" -T -
+mkdir -p "$stage/winbin"
+cp "$luajit_out/bin/luajit.exe" "zig-out/$triple/ReleaseFast/bin/uuidv7z.exe" \
+	"zig-out/$triple/ReleaseFast/bin/uuidv7.dll" "$stage/winbin/"
+chmod u+w "$stage/winbin/"*
+cat > "$stage/winbin/run.sh" <<'EOF'
+cd "$(dirname "$0")/.." || exit 1
+export PATH="$PWD/winbin:$PATH" UUIDV7Z="$PWD/winbin/uuidv7z.exe"
+export UUIDV7_ZIG_LIB="$(cygpath -w "$PWD/winbin/uuidv7.dll")"
+uname -s
+./test
+EOF
+tar -cf "$stage/winbin.tar" -C "$stage" winbin
+
+ssh -o BatchMode=yes "$host" "if exist \"%TEMP%\\$remote_dir\" rmdir /s /q \"%TEMP%\\$remote_dir\" & mkdir \"%TEMP%\\$remote_dir\"" 2>&1 | quiet
+scp -q -o BatchMode=yes "$stage/src.tar" "$stage/winbin.tar" "$host:AppData/Local/Temp/$remote_dir/" 2>&1 | quiet
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+	echo "test-windows: copying to $host failed" >&2; exit 1
+fi
+ssh -o BatchMode=yes "$host" "cd /d \"%TEMP%\\$remote_dir\" && tar -xf src.tar && tar -xf winbin.tar && \"C:\\Program Files\\Git\\bin\\bash.exe\" winbin/run.sh" 2>&1 | quiet
+rc=${PIPESTATUS[0]}
+[ "$rc" -eq 0 ] && echo "test-windows: ./test passed on $host" || echo "test-windows: ./test FAILED on $host (rc=$rc)" >&2
+exit "$rc"

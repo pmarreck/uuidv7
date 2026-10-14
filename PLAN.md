@@ -3,7 +3,7 @@
 Open work in priority order. Completed items: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Direction and done criteria: [intents/three_os_and_zig_port.md](intents/three_os_and_zig_port.md).
 
 ## Next (authorized, unblocked)
-- [ ] Reproducible Windows test toolchain: flake output for the static mingw LuaJIT used by Windows runs (currently an ad hoc override)
+- [x] Reproducible Windows test toolchain: flake output luajit-windows-x86_64 + import check, and ./test-windows runner (done 2026-10-14 14:32 EDT)
 
 ## Awaiting BDFN decisions (queued in the walking brief)
 - [ ] Decision uuidv7-os-rng-failure-policy: refuse to generate when the OS RNG fails, or keep the warn + insecure fallback (both implementations)

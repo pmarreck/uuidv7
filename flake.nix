@@ -75,7 +75,7 @@
             mainProgram = "uuidv7z";
           };
         };
-      in {
+      in pkgs.lib.recursiveUpdate {
         packages.default = uuidv7;
         packages.uuidv7 = uuidv7;
         packages.uuidv7z = uuidv7z;
@@ -103,5 +103,29 @@
         devShells.default = pkgs.mkShell {
           packages = runtimeTools ++ testTools ++ [ zig pkgs.file ];
         };
-      });
+      } (pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+        # The Windows toolchain for real-host test runs (./test-windows): a static
+        # LuaJIT executable needing no lua51.dll. The check inspects the binary
+        # itself rather than trusting the build flags.
+        packages.luajit-windows-x86_64 =
+          let
+            static = pkgs.pkgsCross.mingwW64.luajit.overrideAttrs (old: {
+              makeFlags = old.makeFlags ++ [ "BUILDMODE=static" ];
+            });
+          in pkgs.runCommand "luajit-windows-x86_64" { } ''
+            mkdir -p $out/bin
+            cp -L ${static}/bin/luajit $out/bin/luajit.exe
+          '';
+        checks.luajit-windows-x86_64 = pkgs.runCommand "luajit-windows-x86_64-check"
+          { nativeBuildInputs = [ pkgs.file pkgs.binutils ]; } ''
+            exe=${self.packages.${system}.luajit-windows-x86_64}/bin/luajit.exe
+            desc=$(file -b "$exe")
+            echo "$desc"
+            case "$desc" in "PE32+ executable"*console*x86-64*) ;; *) echo "not a PE32+ x86-64 console executable"; exit 1 ;; esac
+            dlls=$(objdump -p "$exe" | sed -n 's/^[[:space:]]*DLL Name: //p' | tr 'A-Z' 'a-z' | sort -u | tr '\n' ' ')
+            echo "imports: $dlls"
+            [ "$dlls" = "kernel32.dll msvcrt.dll " ] || { echo "unexpected DLL imports"; exit 1; }
+            touch $out
+          '';
+      }));
 }

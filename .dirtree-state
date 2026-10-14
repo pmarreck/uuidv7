@@ -14,6 +14,7 @@ annotate=[
 	src/ffi.zig = C ABI exports (pointer+length) over the pure core
 	src/uuidv7.zig = pure Zig core: advance (monotonic counter), encode, format, extract, parseTimestamp, state codec
 	src/uuidv7_test.zig = Zig core unit tests incl. sorted sweep
+	test-windows = run the full ./test on a real Windows host over SSH (UUIDV7_WINDOWS_HOST)
 	tests/uuidv7_clock_test = injected-clock tests: monotonic+unique at 1ms/100ns/1ns ticks, backward steps, frozen clock, counter overflow
 	tests/uuidv7_differential_test = LuaJIT oracle vs Zig C ABI: encode, advance, extract, parse, round-trips, sorted sweep
 	tests/uuidv7_windows_test = Windows-only CLI contract: daemon refusal, secure RNG, LockFileEx counter ordering across processes
