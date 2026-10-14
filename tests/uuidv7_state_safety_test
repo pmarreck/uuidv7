@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# The counter state file must never be a way to write elsewhere: a symlink
+# planted at the state path (for example in a shared /tmp) is not followed, so its
+# target is neither overwritten nor created. Checked for both CLIs.
+set -u
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export UUIDV7_NO_DAEMON=1 UUIDV7_SILENCE_INSECURE_RANDOM=1
+TMPDIR="$(mktemp -d)"; export TMPDIR
+trap 'rm -rf "$TMPDIR"' EXIT
+
+case "$(uname -s)" in
+	MINGW*|MSYS*|CYGWIN*) echo "n/a: symlink planting needs POSIX symlinks (this OS: $(uname -s))"; exit 0 ;;
+esac
+
+tests=0 fails=0
+check() {
+	tests=$((tests + 1))
+	if eval "$2"; then echo "✓ $1"; else fails=$((fails + 1)); echo "✗ $1" >&2; fi
+}
+
+clis=("lua:luajit $here/../bin/uuidv7")
+if [ -n "${UUIDV7Z:-}" ]; then clis+=("zig:$UUIDV7Z"); else echo "✗ UUIDV7Z is not set; uuidv7z not checked" >&2; fails=$((fails + 1)); fi
+
+for entry in "${clis[@]}"; do
+	name="${entry%%:*}" cmd="${entry#*:}"
+	d="$TMPDIR/$name"; mkdir -p "$d/state" "$d/elsewhere"
+	printf 'precious data\n' > "$d/elsewhere/victim"
+	ln -s "$d/elsewhere/victim" "$d/state/uuidv7-sequence"
+	out="$(TMPDIR="$d/state" $cmd 2>/dev/null)"; rc=$?
+	check "$name: a symlinked state file's target is not overwritten" '[ "$(cat "$d/elsewhere/victim")" = "precious data" ]'
+	check "$name: generation still succeeds" '[ "$rc" -eq 0 ] && [[ "$out" =~ ^[0-9a-f]{32}$ ]]'
+
+	mv "$d/state/uuidv7-sequence" "$d/old-link"
+	ln -s "$d/elsewhere/created" "$d/state/uuidv7-sequence"
+	TMPDIR="$d/state" $cmd >/dev/null 2>&1
+	check "$name: a dangling symlink's target is not created" '[ ! -e "$d/elsewhere/created" ]'
+done
+
+echo "$((tests - fails))/$tests state-safety tests passed"
+[ "$fails" -eq 0 ]

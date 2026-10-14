@@ -36,6 +36,8 @@ ffi.cdef[[
 local C = ffi.C
 -- open(2) flags differ by platform; O_RDWR is 2 on both.
 local O_RDWR, O_CREAT = 0x0002, (jit.os == "OSX") and 0x0200 or 0x0040
+-- O_NOFOLLOW: a symlink planted at the state path is refused, never written through.
+local O_NOFOLLOW = (jit.os == "OSX") and 0x0100 or ((jit.arch == "arm64" or jit.arch == "arm") and 0x8000 or 0x20000)
 local M = {}
 
 M.VERSION = "0.2.0"
@@ -216,7 +218,7 @@ function FsCounter:new()
 	return setmetatable({ filepath = tmp .. "/uuidv7-sequence", _nt = nil, _ctr = nil }, self)
 end
 function FsCounter:get_next(current_nt, is_static, random_u64)
-	local fd = C.open(self.filepath, bit.bor(O_CREAT, O_RDWR), ffi.new("int", 438))
+	local fd = C.open(self.filepath, bit.bor(O_CREAT, O_RDWR, O_NOFOLLOW), ffi.new("int", 438))
 	if fd < 0 then
 		self._nt, self._ctr = advance(self._nt, self._ctr, current_nt, is_static, random_u64)
 		return self._nt, self._ctr, "new"

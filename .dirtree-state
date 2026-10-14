@@ -19,6 +19,7 @@ annotate=[
 	tests/uuidv7_clock_test = injected-clock tests: monotonic+unique at 1ms/100ns/1ns ticks, backward steps, frozen clock, counter overflow
 	tests/uuidv7_concurrency_test = 24 concurrent local CLI processes at one ns: all unique, each stream strictly increasing
 	tests/uuidv7_differential_test = LuaJIT oracle vs Zig C ABI: encode, advance, extract, parse, round-trips, sorted sweep
+	tests/uuidv7_state_safety_test = Both CLIs refuse a symlink planted at the counter state path (no overwrite, no create)
 	tests/uuidv7_stub_daemon.lua = Stub UDS daemon: fixed reply to every request, records request lines, stops on STOP
 	tests/uuidv7_testsh.lua = Test helper: runs POSIX shell lines on every OS (via Git Bash scripts on Windows); popen/execute/kill/cleanup
 	tests/uuidv7_windows_test = Windows-only CLI contract: daemon refusal, secure RNG, LockFileEx counter ordering across processes

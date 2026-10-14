@@ -167,7 +167,8 @@ static uuidv7_state next_state(int64_t current, int is_static) {
 	memcpy(path, dir, dl);
 	path[dl] = '/';
 	memcpy(path + dl + 1, STATE_FILE, sizeof STATE_FILE);
-	int fd = open(path, O_CREAT | O_RDWR, 0666);
+	/* O_NOFOLLOW: a symlink planted at the state path is refused, never written through. */
+	int fd = open(path, O_CREAT | O_RDWR | O_NOFOLLOW, 0666);
 	free(path);
 	if (fd >= 0) {
 		if (flock(fd, LOCK_EX) == 0) {

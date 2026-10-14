@@ -36,6 +36,7 @@ fi
 "$here/tests/uuidv7_layout_test" || rc=$?   # RFC bit-layout contract
 "$here/tests/uuidv7_clock_test"  || rc=$?   # injected coarse/backward clock ordering
 "$here/tests/uuidv7_concurrency_test" || rc=$?   # concurrent CLI processes: unique + per-process ordered
+"$here/tests/uuidv7_state_safety_test" || rc=$?   # state file never followed through a planted symlink
 "$here/tests/uuidv7_extract_test" || rc=$?   # timestamp extraction round-trip
 "$here/tests/uuidv7_windows_test" || rc=$?   # Windows CLI contract (n/a elsewhere)
 "$here/tests/uuidv7_differential_test" || rc=$?   # Zig core vs LuaJIT oracle through the C ABI

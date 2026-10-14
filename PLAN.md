@@ -9,6 +9,7 @@ Open work in priority order. Completed items: [docs/PLAN_LOG.md](docs/PLAN_LOG.m
 	- [x] uuidv7z uses the shared `$TMPDIR/uuidv7-sequence` file; alternating and mixed-concurrent cross-CLI tests (done 2026-10-14 18:02 EDT)
 	- [x] uuidv7z routes live generation to a running uuidv7 daemon (C client over AF_UNIX / Winsock; retry policy in the Zig core, 968a3e0) (done 2026-10-14 18:13 EDT)
 - [x] Reproducible Windows test toolchain: flake output luajit-windows-x86_64 + import check, and ./test-windows runner (done 2026-10-14 14:32 EDT)
+- [ ] Counter/daemon scope audit (Turing request 2026-10-14): state file and socket are found via TMPDIR/XDG_RUNTIME_DIR, so sharing is per matching environment; add deterministic regressions for differing TMPDIR, daemon/standalone transitions and unsafe shared /tmp, then fix within per-user scope (context: docs/plan_context/counter_scope.md)
 
 ## Awaiting BDFN decisions (queued in the walking brief)
 - [ ] Decision uuidv7-os-rng-failure-policy revision 2 (queued 2026-10-14): fail closed or keep the warn + clock-seeded fallback when the OS RNG fails
