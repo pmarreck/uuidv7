@@ -67,6 +67,18 @@ Per-user scope that does not depend on the environment:
   after boot cannot reorder values.
 - The daemon seeds its counter from the state file at start and writes its last
   state back on stop and before a restart.
+  This alone covers only graceful stops. A daemon crash or power loss loses its
+  in-memory state, and explicit-time requests still use the file while the daemon
+  runs, so the design and its tests must also cover:
+  - crash and restart of the daemon, including after a clock step back;
+  - the daemon and file-based allocation running at the same time.
+  Options: the daemon writes the file on every allocation (exact, costs a locked
+  write per request), or durably reserves ahead (records a high-water mark past
+  the values it will serve, so a restart starts beyond it). Reserving ahead
+  avoids a write per ID but leaves gaps and, if it reserves time, can push
+  timestamps ahead of the clock. Crash safety across power loss also needs fsync,
+  not only a write. Until one of these is built and tested, the daemon is not
+  crash-persistent.
 - Clients refuse a daemon whose peer is a different user (`SO_PEERCRED` on Linux,
   `getpeereid` on macOS).
 - An unusable state file: fail closed (exit 1) or warn and fall back to

@@ -12,7 +12,7 @@ Open work in priority order. Completed items: [docs/PLAN_LOG.md](docs/PLAN_LOG.m
 - [ ] Counter/daemon scope audit (Turing request 2026-10-14): state file and socket are found via TMPDIR/XDG_RUNTIME_DIR, so sharing is per matching environment; add deterministic regressions for differing TMPDIR, daemon/standalone transitions and unsafe shared /tmp, then fix within per-user scope (context: docs/plan_context/counter_scope.md)
 	- [x] Measure the boundaries: differing TMPDIR 20/40 out of order, nix develop sets a per-shell TMPDIR, unusable file falls back silently, socket uses a different lookup (done 2026-10-14 19:25 EDT)
 	- [x] Fix: state file written through a planted symlink (O_NOFOLLOW in both CLIs, tests/uuidv7_state_safety_test) (done 2026-10-14 19:21 EDT, 7746c5a)
-	- [ ] Per-user, environment-independent state and socket location, daemon seeding/write-back, daemon owner check: waits on decision uuidv7-counter-scope
+	- [ ] Per-user, environment-independent state and socket location, daemon owner check, and daemon state persistence covering crash/restart and concurrent file allocation (not just graceful write-back): waits on decision uuidv7-counter-scope
 
 ## Awaiting BDFN decisions (queued in the walking brief)
 - [ ] Decision uuidv7-counter-scope revision 1 (queued 2026-10-14): per-user home-directory state (recommended), per-user runtime directory, a system service, or defer
