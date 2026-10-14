@@ -1,0 +1,138 @@
+#!/usr/bin/env luajit
+-- uuidv7z as a daemon client. Against a real `uuidv7 --daemon`: live generation is
+-- served by the daemon (machine-wide ordering with the LuaJIT CLI), explicit times
+-- and UUIDV7_NO_DAEMON stay local. Against a stub daemon that refuses every request:
+-- bounded retries with R<attempt>W<waited> telemetry, then exit 1 with no output,
+-- never a silent local value. No sleeps: both servers announce readiness on stdout.
+local self_dir = (arg and arg[0] or ""):match("^(.*)[/\\][^/\\]+$") or "."
+package.path = self_dir .. "/../lib/?.lua;" .. package.path
+local client = require("uuidv7_client")
+local sh = dofile(self_dir .. "/uuidv7_testsh.lua")
+
+local zcli = os.getenv("UUIDV7Z")
+if not zcli or zcli == "" then
+	io.stderr:write("uuidv7z_daemon_test: set UUIDV7Z to the uuidv7z executable\n")
+	os.exit(1)
+end
+
+local tests, fails = 0, 0
+local function ok(name, cond, detail)
+	tests = tests + 1
+	if cond then io.write("\u{2713} " .. name .. "\n")
+	else io.stderr:write("\u{2717} " .. name .. (detail and (": " .. tostring(detail)) or "") .. "\n"); fails = fails + 1 end
+end
+
+local base = (os.getenv("TMPDIR") or os.getenv("TEMP") or "/tmp"):gsub("/+$", "")
+local run = base .. "/uuidv7z_dtest_" .. tostring(os.time())
+sh.execute("mkdir -p '" .. run .. "'")
+local sock = run .. "/d.sock"
+local exe = self_dir .. "/../bin/uuidv7"
+local libp = self_dir .. "/../lib/?.lua;;"
+
+local function read_file(p) local f = io.open(p, "rb"); if not f then return "" end; local s = f:read("*a"); f:close(); return s end
+local function lines_of(s) local t = {}; for l in (s or ""):gmatch("[^\n]+") do t[#t + 1] = l end; return t end
+-- Request lines recorded by the stub; the bare first request is an empty line.
+local function requests_in(p) return select(2, read_file(p):gsub("\n", "")) end
+local function wait_for(h, marker)
+	while true do local l = h:read("*l"); if not l then return false end; if l:find(marker, 1, true) then return true end end
+end
+-- Run a CLI with extra env; returns stdout, stderr, success.
+local function cli(env, prog, args)
+	local errf = run .. "/err"
+	local h = sh.popen(string.format("env %s %q %s 2>%q; echo \"rc=$?\"", env, prog, args, errf), "r")
+	local out = h:read("*a"); h:close()
+	local rc = tonumber(out:match("rc=(%d+)\n?$"))
+	return out:gsub("rc=%d+\n?$", ""), read_file(errf), rc
+end
+local function served() return tonumber((client.oneshot(sock, "sj") or ""):match('"uuids_served":(%d+)')) end
+local env_d = string.format("UUIDV7_SOCK=%q LUA_PATH=%q UUIDV7_SILENCE_INSECURE_RANDOM=1", sock, libp)
+
+-- ---------- real daemon ----------
+local dh, pid, stopped
+local function real_daemon()
+	dh = sh.popen(string.format("env %s UUIDV7_LOG=%q %q --daemon 2>%q", env_d, run .. "/d.log", exe, run .. "/derr"), "r")
+	ok("daemon announces listening", wait_for(dh, "UUIDV7-LISTENING"))
+	pid = (client.oneshot(sock, "sj") or ""):match('"pid":(%d+)')
+
+	local before = served()
+	local out, err, rc = cli(env_d, zcli, "")
+	ok("uuidv7z live generation is served by the daemon",
+		rc == 0 and out:match("^%x+\n$") and #out == 33 and err == "" and served() == before + 1,
+		("rc=%s out=[%s] err=[%s] served %s->%s"):format(rc, out, err, before, served()))
+
+	before = served()
+	out, err, rc = cli(env_d, zcli, "--hyphen")
+	ok("uuidv7z --hyphen is served hyphenated by the daemon",
+		rc == 0 and #out == 37 and out:sub(15, 15) == "7" and served() == before + 1, out)
+
+	before = served()
+	out, err, rc = cli(env_d, zcli, "1700000000000000000")
+	ok("explicit timestamps stay local", rc == 0 and out:sub(1, 12) == "018bcfe56800" and served() == before, out)
+
+	before = served()
+	out, err, rc = cli(env_d .. " UUIDV7_NO_DAEMON=1", zcli, "")
+	ok("UUIDV7_NO_DAEMON keeps generation local", rc == 0 and #out == 33 and served() == before, out)
+
+	-- Machine-wide ordering: both CLIs draw from the daemon's one counter.
+	local prev, good = "", 0
+	for i = 1, 10 do
+		for _, prog in ipairs({ exe, zcli }) do
+			local o = cli(env_d, prog, "")
+			if o > prev then good = good + 1 end
+			prev = o
+		end
+	end
+	ok("uuidv7 and uuidv7z alternating through the daemon strictly increase (" .. good .. "/20)", good == 20)
+
+	local shut = client.oneshot(sock, "+++") == "OK\n"
+	ok("daemon shuts down", shut)
+	if shut then dh:read("*a"); stopped = true end
+
+	out, err, rc = cli(env_d, zcli, "")
+	ok("with the daemon gone, uuidv7z generates locally", rc == 0 and #out == 33 and err == "", err)
+end
+
+-- ---------- stub daemon that refuses ----------
+local sth, stub_stopped
+local function refusing_daemon()
+	local rec = run .. "/requests"
+	sth = sh.popen(string.format("luajit %q %q %q %q", self_dir .. "/uuidv7_stub_daemon.lua", sock, "ERR busy\\n", rec), "r")
+	ok("stub daemon announces listening", wait_for(sth, "STUB-LISTENING"))
+
+	local out, err, rc = cli(env_d .. " UUIDV7_DAEMON_RETRIES=3", zcli, "--hyphen")
+	local reqs = lines_of(read_file(rec))
+	ok("a refusing daemon makes uuidv7z exit 1", rc == 1, rc)
+	ok("... with nothing on stdout (no silent local value)", out == "", out)
+	ok("... and says why, with the last reply", err:match("would not serve a UUID after 3 attempts") ~= nil
+		and err:match("ERR busy") ~= nil and err:match("^uuidv7z: ") ~= nil, err)
+	ok("... after exactly 3 requests with retry telemetry",
+		#reqs == 3 and reqs[1] == "-" and reqs[2]:match("^%-R2W50$") and reqs[3]:match("^%-R3W%d+$"), table.concat(reqs, "|"))
+
+	sh.execute("rm -f '" .. rec .. "'")
+	out, err, rc = cli(env_d .. " UUIDV7_DAEMON_NO_RETRY=1", zcli, "")
+	ok("UUIDV7_DAEMON_NO_RETRY: one request, then exit 1",
+		rc == 1 and requests_in(rec) == 1 and err:match("retries are disabled") ~= nil, err)
+
+	sh.execute("rm -f '" .. rec .. "'")
+	out, err, rc = cli(env_d .. " UUIDV7_DAEMON_RETRY_TIMEOUT_US=0", zcli, "")
+	ok("a zero wait budget gives up on the timeout after one request",
+		rc == 1 and requests_in(rec) == 1 and err:match("retry timeout") ~= nil, err)
+
+	client.oneshot(sock, "STOP")
+	sth:read("*a")
+	stub_stopped = true
+end
+
+local okrun, perr = pcall(function() real_daemon(); refusing_daemon() end)
+if pid and not stopped then sh.kill(pid) end
+if dh then pcall(function() dh:close() end) end
+-- Closing a popen handle waits for the child, so stop the stub first.
+if sth and not stub_stopped then client.oneshot(sock, "STOP") end
+if sth then pcall(function() sth:close() end) end
+local derr = read_file(run .. "/derr")
+if #derr > 0 then io.stderr:write("----- daemon stderr -----\n" .. derr .. "-------------------------\n") end
+sh.execute("rm -rf '" .. run .. "' 2>/dev/null")
+sh.cleanup()
+if not okrun then io.stderr:write("uuidv7z daemon test crashed: " .. tostring(perr) .. "\n"); os.exit(1) end
+if fails > 0 then io.stderr:write(fails .. " of " .. tests .. " uuidv7z daemon tests failed!\n"); os.exit(1) end
+io.write("All " .. tests .. " uuidv7z daemon tests passed!\n")

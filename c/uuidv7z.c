@@ -1,9 +1,10 @@
 /*
  * uuidv7z: C CLI over the pure Zig UUIDv7 core, using only the C ABI in
  * uuidv7.h. This file owns all I/O (clock, OS randomness, the locked counter
- * state file, argv/env, stdout/stderr); every decision about bits, parsing and
- * ordering is made by the core. Behavior mirrors the LuaJIT `uuidv7` CLI except
- * for the daemon (LuaJIT-only) and --test.
+ * state file, the daemon socket, argv/env, stdout/stderr); every decision about
+ * bits, parsing, ordering and daemon retries is made by the core. Behavior
+ * mirrors the LuaJIT `uuidv7` CLI, which alone can run the daemon (--daemon,
+ * --api) and has --test; uuidv7z is a client of a running daemon.
  */
 #if defined(__linux__)
 #define _DEFAULT_SOURCE
@@ -19,6 +20,8 @@
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <afunix.h>
 #include <windows.h>
 #include <bcrypt.h>
 #include <fcntl.h>
@@ -27,6 +30,8 @@
 #else
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 #if defined(__linux__) || defined(__APPLE__)
@@ -204,6 +209,186 @@ static void generate(int has_static, int64_t static_ns, int hyphens) {
 	emit_line(text, len);
 }
 
+/* ---- daemon client: route live generation to a running `uuidv7 --daemon` ---- */
+
+#ifdef _WIN32
+typedef SOCKET sock_t;
+#define BAD_SOCK INVALID_SOCKET
+#define sock_close closesocket
+#define SHUT_WR SD_SEND
+#else
+typedef int sock_t;
+#define BAD_SOCK (-1)
+#define sock_close close
+#endif
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+#define DAEMON_REPLY_MAX 4096
+
+/* The daemon's socket: $UUIDV7_SOCK, else uuidv7.sock in XDG_RUNTIME_DIR, TMPDIR,
+ * (Windows) TEMP or TMP, or /tmp, with trailing '/' removed: the same lookup as
+ * the LuaJIT client, so both find the same daemon. Caller frees. */
+static char *daemon_socket_path(void) {
+	const char *sock = getenv("UUIDV7_SOCK");
+	if (sock) {
+		char *p = malloc(strlen(sock) + 1);
+		if (!p) die(PROG ": out of memory\n");
+		return strcpy(p, sock);
+	}
+	const char *base = getenv("XDG_RUNTIME_DIR");
+	if (!base) base = getenv("TMPDIR");
+#ifdef _WIN32
+	if (!base) base = getenv("TEMP");
+	if (!base) base = getenv("TMP");
+#endif
+	if (!base) base = "/tmp";
+	size_t bl = strlen(base);
+	while (bl > 0 && base[bl - 1] == '/') bl--;
+	static const char name[] = "/uuidv7.sock";
+	char *p = malloc(bl + sizeof name);
+	if (!p) die(PROG ": out of memory\n");
+	memcpy(p, base, bl);
+	memcpy(p + bl, name, sizeof name);
+	return p;
+}
+
+/* One request on a fresh connection: send `line` plus a newline, half-close,
+ * then read the whole reply (anything past `cap` bytes is discarded). Returns 0
+ * when no daemon accepts the connection, else 1 with the reply in `reply`. */
+static int daemon_oneshot(const char *path, const char *line, size_t line_len,
+	char *reply, size_t cap, size_t *reply_len) {
+	struct sockaddr_un addr;
+	memset(&addr, 0, sizeof addr);
+	addr.sun_family = AF_UNIX;
+	if (strlen(path) >= sizeof addr.sun_path) return 0;
+	strcpy(addr.sun_path, path);
+	sock_t s = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (s == BAD_SOCK) return 0;
+#ifdef SO_NOSIGPIPE
+	int one = 1;
+	setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+	if (connect(s, (const struct sockaddr *)&addr, sizeof addr) != 0) {
+		sock_close(s);
+		return 0;
+	}
+	char msg[UUIDV7_RETRY_REQUEST_MAX + 1];
+	memcpy(msg, line, line_len);
+	msg[line_len] = '\n';
+	for (size_t sent = 0; sent < line_len + 1;) {
+		int n = (int)send(s, msg + sent, (int)(line_len + 1 - sent), MSG_NOSIGNAL);
+		if (n <= 0) break;
+		sent += (size_t)n;
+	}
+	shutdown(s, SHUT_WR);
+	size_t got = 0;
+	char sink[512];
+	for (;;) {
+		char *dst = got < cap ? reply + got : sink;
+		size_t room = got < cap ? cap - got : sizeof sink;
+		int n = (int)recv(s, dst, (int)room, 0);
+		if (n <= 0) break;
+		if (got < cap) got += (size_t)n;
+	}
+	sock_close(s);
+	*reply_len = got;
+	return 1;
+}
+
+static void sleep_us(uint64_t us) {
+	if (us == 0) return;
+#ifdef _WIN32
+	/* Sleep() has millisecond granularity: wait out short backoffs on the
+	 * performance counter, as the LuaJIT client does. */
+	if (us >= 2000) { Sleep((DWORD)(us / 1000)); return; }
+	LARGE_INTEGER freq, t0, t;
+	QueryPerformanceFrequency(&freq);
+	QueryPerformanceCounter(&t0);
+	int64_t ticks = (int64_t)(freq.QuadPart * (int64_t)us / 1000000);
+	do { Sleep(0); QueryPerformanceCounter(&t); } while (t.QuadPart - t0.QuadPart < ticks);
+#else
+	struct timespec ts = { (time_t)(us / 1000000), (long)(us % 1000000) * 1000 };
+	nanosleep(&ts, NULL);
+#endif
+}
+
+/* Retry jitter in [0, 1): splitmix64 of the clock. Only de-synchronizes
+ * competing clients, so it needs no cryptographic quality. */
+static double jitter_unit(uint64_t *s) {
+	uint64_t z = (*s += 0x9E3779B97F4A7C15ULL);
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+	return (double)((z ^ (z >> 31)) >> 11) * 0x1p-53;
+}
+
+static size_t env_text(const char *name, const char **out) {
+	*out = getenv(name);
+	return *out ? strlen(*out) : 0;
+}
+
+/* Serve a live request from a running daemon. Returns 0 when no daemon is
+ * reachable (local generation is then correct); returns 1 after printing the
+ * daemon's reply. A daemon that answers but will not serve within the retry
+ * budget is an error: generating locally could sort out of order against the
+ * daemon's stream, so this exits 1 instead of falling back. */
+static int try_daemon(int hyphens) {
+	if (getenv("UUIDV7_NO_DAEMON")) return 0;
+	char *path = daemon_socket_path();
+#ifdef _WIN32
+	WSADATA wsa;
+	if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { free(path); return 0; }
+#endif
+	const char *nr, *rt, *to;
+	size_t nrl = env_text("UUIDV7_DAEMON_NO_RETRY", &nr);
+	size_t rtl = env_text("UUIDV7_DAEMON_RETRIES", &rt);
+	size_t tol = env_text("UUIDV7_DAEMON_RETRY_TIMEOUT_US", &to);
+	uint32_t max_attempts;
+	uint64_t timeout_us, seed = (uint64_t)now_ns();
+	if (uuidv7_retry_attempts(nr, nrl, rt, rtl, &max_attempts) != UUIDV7_OK ||
+		uuidv7_retry_timeout_us(to, tol, &timeout_us) != UUIDV7_OK)
+		die(PROG ": internal error reading the daemon retry settings\n");
+	uuidv7_retry r;
+	uuidv7_retry_init(&r);
+	char line[UUIDV7_RETRY_REQUEST_MAX], reply[DAEMON_REPLY_MAX];
+	size_t line_len, reply_len;
+	for (;;) {
+		if (uuidv7_retry_request(&r, hyphens, line, sizeof line, &line_len) != UUIDV7_OK)
+			die(PROG ": internal error building a daemon request\n");
+		if (!daemon_oneshot(path, line, line_len, reply, sizeof reply, &reply_len)) { free(path); return 0; }
+		if (uuidv7_reply_served(reply, reply_len) == 1) {
+			free(path);
+			fwrite(reply, 1, reply_len, stdout);
+			if (fflush(stdout) != 0 || ferror(stdout)) exit(1);
+			return 1;
+		}
+		uuidv7_retry next;
+		uint8_t action;
+		uint64_t pause;
+		if (uuidv7_retry_after_refusal(&r, max_attempts, timeout_us, jitter_unit(&seed), &next, &action, &pause) != UUIDV7_OK)
+			die(PROG ": internal error in the daemon retry policy\n");
+		if (action != UUIDV7_RETRY_SLEEP) {
+			while (reply_len > 0 && (reply[reply_len - 1] == '\n' || reply[reply_len - 1] == '\r' ||
+				reply[reply_len - 1] == ' ' || reply[reply_len - 1] == '\t')) reply_len--;
+			fprintf(stderr, PROG ": daemon at %s is reachable but would not serve a UUID ", path);
+			if (action == UUIDV7_RETRY_GIVE_UP_TIMEOUT)
+				fprintf(stderr, "within the %lluus retry timeout (%lu attempts, waited %lluus)",
+					(unsigned long long)timeout_us, (unsigned long)r.attempt, (unsigned long long)r.waited_us);
+			else if (r.attempt <= 1)
+				fputs("and retries are disabled (UUIDV7_DAEMON_NO_RETRY)", stderr);
+			else
+				fprintf(stderr, "after %lu attempts (waited %lluus)", (unsigned long)r.attempt, (unsigned long long)r.waited_us);
+			if (reply_len > 0) fprintf(stderr, " (last reply: %.*s)", (int)reply_len, reply);
+			fputs("; refusing to silently generate locally (that could break monotonicity). "
+				"Retry, raise UUIDV7_DAEMON_RETRY_TIMEOUT_US, or stop the daemon with `uuidv7 --api +++`.\n", stderr);
+			free(path);
+			exit(1);
+		}
+		sleep_us(pause);
+		r = next;
+	}
+}
+
 static _Noreturn void refuse_range(const char *s) {
 	fprintf(stderr, PROG ": timestamp out of range: %s (expected 0 to 9223372036854775807 nanoseconds since the Unix epoch)\n", s);
 	exit(1);
@@ -247,9 +432,14 @@ static void show_help(void) {
 		"  argument is an error.\n"
 		"\n"
 		"Strict ordering across processes comes from an exclusively locked counter file,\n"
-		"$TMPDIR/uuidv7-sequence (Windows: %TMPDIR%, %TEMP% or %TMP%). The daemon\n"
-		"(--daemon, --api) exists only in the LuaJIT `uuidv7`.\n"
-		"Env: TMPDIR, UUIDV7_NS_EXTRACT_OK, UUIDV7_SILENCE_INSECURE_RANDOM.\n"
+		"$TMPDIR/uuidv7-sequence (Windows: %TMPDIR%, %TEMP% or %TMP%), shared with the\n"
+		"LuaJIT `uuidv7`. When a `uuidv7 --daemon` is running, live generation is served\n"
+		"by it, so both CLIs draw from one counter; explicit timestamps stay local. If a\n"
+		"reachable daemon will not serve, uuidv7z retries it and then exits 1 rather than\n"
+		"generating locally. Only the LuaJIT `uuidv7` runs the daemon (--daemon, --api).\n"
+		"Env: TMPDIR, UUIDV7_SOCK, UUIDV7_NO_DAEMON, UUIDV7_DAEMON_RETRIES,\n"
+		"  UUIDV7_DAEMON_RETRY_TIMEOUT_US, UUIDV7_DAEMON_NO_RETRY, UUIDV7_NS_EXTRACT_OK,\n"
+		"  UUIDV7_SILENCE_INSECURE_RANDOM.\n"
 		"\n"
 		"Examples:\n"
 		"  uuidv7z                      Generate UUID without hyphens\n"
@@ -337,7 +527,7 @@ int main(int argc, char **argv) {
 		size_t vl;
 		const char *v = uuidv7_version(&vl);
 		printf(PROG " %.*s Generate RFC 9562 UUIDv7 with nanosecond precision (" ARCH "-" OS ")\n", (int)vl, v);
-	} else {
+	} else if (has_static || !try_daemon(hyphens)) {
 		generate(has_static, static_ns, hyphens);
 	}
 	return 0;

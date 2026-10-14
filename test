@@ -41,6 +41,7 @@ fi
 "$here/tests/uuidv7_differential_test" || rc=$?   # Zig core vs LuaJIT oracle through the C ABI
 "$here/tests/uuidv7z_cli_test"  || rc=$?   # uuidv7z CLI vs LuaJIT CLI
 "$here/tests/uuidv7_daemon_test" || rc=$?   # UDS daemon (black-box)
+"$here/tests/uuidv7z_daemon_test" || rc=$?   # uuidv7z as a daemon client (real + refusing stub)
 "$here/tests/uuidv7_fallback_test" || rc=$?   # daemon retry / no-silent-fallback policy
 "$here/tests/uuidv7_load_test"    || rc=$?   # concurrency invariants under load (no perf gating)
 "$here/tests/uuidv7_fuzz_test"    || rc=$?   # hostile/malformed protocol input (robustness)

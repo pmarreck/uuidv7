@@ -49,7 +49,10 @@ pub fn build(b: *std.Build) void {
 		.flags = if (optimize == .Debug) c_flags ++ &[_][]const u8{"-DUUIDV7Z_DEBUG_BUILD=1"} else c_flags,
 	});
 	cli_module.linkLibrary(static_lib);
-	if (is_windows) cli_module.linkSystemLibrary("bcrypt", .{});
+	if (is_windows) {
+		cli_module.linkSystemLibrary("bcrypt", .{});
+		cli_module.linkSystemLibrary("ws2_32", .{});
+	}
 	const cli = b.addExecutable(.{ .name = "uuidv7z", .root_module = cli_module });
 	b.installArtifact(cli);
 

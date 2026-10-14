@@ -94,11 +94,17 @@ bin/linux/x86_64/uuidv7z --hyphen
 ```
 
 `uuidv7z` accepts the same arguments and produces the same results as `uuidv7`, except
-that it has no daemon (`--daemon`/`--api` are refused) and no `--test`, and `--about`
-prints its version and platform. Both CLIs share one exclusively locked counter
-file, `$TMPDIR/uuidv7-sequence` (same `<nanotime>:<counter>` text and the same
-`flock`/`LockFileEx` locking), so values from `uuidv7` and `uuidv7z` processes on
-one machine are strictly ordered with respect to each other.
+that it cannot run the daemon (`--daemon`/`--api` are refused), has no `--test`, and
+`--about` prints its version and platform. Both CLIs keep machine-wide order:
+
+- Without a daemon they share one exclusively locked counter file,
+  `$TMPDIR/uuidv7-sequence` (same `<nanotime>:<counter>` text and the same
+  `flock`/`LockFileEx` locking).
+- With a `uuidv7 --daemon` running, `uuidv7z` is a client of it just as `uuidv7` is: live
+  requests go to the daemon's one counter, with the same socket lookup, the same bounded
+  retries (the policy is ported into the Zig core and checked against the LuaJIT client),
+  and the same refusal to fall back to local generation when a reachable daemon will not
+  serve. Explicit timestamps and `UUIDV7_NO_DAEMON` stay local.
 
 The pieces:
 
@@ -211,7 +217,8 @@ and the injected-clock suite, it runs two differential suites with the LuaJIT co
 the oracle: `tests/uuidv7_differential_test` loads the Zig shared library through
 LuaJIT's FFI and compares every C ABI function against `lib/uuidv7_core.lua` on edge
 cases and seeded random samples, and `tests/uuidv7z_cli_test` compares the two CLIs'
-exit codes and output. It also runs the original eight suites: the JSON writer, the core generator, the RFC bit-layout
+exit codes and output; `tests/uuidv7z_daemon_test` runs `uuidv7z` against a real
+daemon and against a stub daemon that refuses every request. It also runs the original eight suites: the JSON writer, the core generator, the RFC bit-layout
 contract, the daemon black-box test (which starts a real daemon and drives it — no
 sleeps; it synchronizes on the daemon's readiness line and on stdout EOF), timestamp
 extraction, the daemon retry / no-silent-fallback policy, a **load test** (many parallel
@@ -238,6 +245,9 @@ tests/uuidv7_concurrency_test                 concurrent local CLI processes sta
 tests/uuidv7_windows_test                     Windows CLI contract (not applicable elsewhere)
 tests/uuidv7_differential_test                Zig C ABI vs the LuaJIT core
 tests/uuidv7z_cli_test                        uuidv7z CLI vs the LuaJIT CLI
+tests/uuidv7z_daemon_test                     uuidv7z as a daemon client (real daemon + refusing stub)
+tests/uuidv7_stub_daemon.lua                  stub daemon with a fixed reply, for client tests
+tests/uuidv7_testsh.lua                       runs the suites' POSIX command lines on every OS
 alternates/uuidv7.{bash,sh}                   pure-bash / POSIX-sh references (not installed)
 src/uuidv7.zig              pure Zig core (port of lib/uuidv7_core.lua)
 src/ffi.zig, include/uuidv7.h   C ABI
