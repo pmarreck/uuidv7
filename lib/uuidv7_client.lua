@@ -120,7 +120,7 @@ end
 
 -- ===== daemon retry policy =====
 -- A reachable daemon owns the live stream. If it momentarily won't serve, we retry
--- IT (never generate locally — that uses the separate fs/SysV counter and could break
+-- IT (never generate locally — that uses the separate locked-file counter and could break
 -- monotonicity). Backoff starts real small and grows ~1.5x with a little jitter, bounded
 -- by BOTH an attempt cap and a total wait timeout, after which we error loudly.
 local BACKOFF_BASE_US    = 50      -- first backoff: 50 microseconds (real small)
@@ -180,7 +180,7 @@ end
 --   "error", msg  -> a daemon answered the socket but would not serve a UUID within the
 --                    retry budget. The caller must NOT generate locally: the daemon
 --                    dispenses from its in-memory counter while local generation uses the
---                    separate fs/SysV counter, so a silent fallback could emit a UUID that
+--                    separate locked-file counter, so a silent fallback could emit a UUID that
 --                    sorts out of order against the daemon's stream. Fail loud instead.
 function M.try_daemon(args, opts)
 	opts = opts or {}

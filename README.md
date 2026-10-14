@@ -25,8 +25,8 @@ remain strictly ordered and unique.
   resolution; per-millisecond monotonicity comes from the clock, not a counter
 - **54-bit monotonic counter** in the rest of `rand_b` — random-initialized each
   nanosecond tick, incremented only on a same-nanosecond collision (so in practice every
-  UUID still carries ~53 bits of fresh entropy). Cross-process via System V shared memory
-  (Linux), a `flock`'d file (macOS) or a `LockFileEx`-locked file (Windows), all under
+  UUID still carries ~53 bits of fresh entropy). Cross-process via an exclusively locked
+  counter file (`flock` on Linux and macOS, `LockFileEx` on Windows), under
   `$TMPDIR` (Windows: `%TMPDIR%`, `%TEMP%` or `%TMP%`)
 - **Clock-rollback safe** — freeze-and-increment keeps monotonicity regardless of how far
   the wall clock jumps back (the 54-bit counter can't overflow in any real window)
@@ -120,7 +120,7 @@ counter is in-memory and strictly monotonic with no cross-process coordination a
 The plain `uuidv7` CLI **transparently uses the daemon** for live generation when its
 socket is reachable (no auto-spawn). When a daemon *is* reachable it is authoritative: the
 CLI gets the UUID from it and **never silently generates locally** — local generation uses
-the separate fs/SysV counter, so a silent fallback could emit a UUID that sorts out of
+the separate locked-file counter, so a silent fallback could emit a UUID that sorts out of
 order against the daemon's in-memory stream, breaking strict monotonicity. If the daemon
 momentarily won't serve, the CLI retries with tiny exponential backoff (50&nbsp;µs base,
 ~1.5× with jitter), tagging each retry with `R<attempt>`/`W<µs-waited>` tokens the daemon
@@ -225,10 +225,10 @@ lib/uuidv7_client.lua       UDS client (CLI fast-path + test driver)
 lib/uuidv7_json.lua         minimal, escape-everything JSON encoder
 tests/uuidv7_{json,test,layout,daemon,extract,fallback,load,fuzz}_test   the eight original suites
 tests/uuidv7_clock_test                       injected coarse/backward clock ordering
+tests/uuidv7_concurrency_test                 concurrent local CLI processes stay unique and ordered
 tests/uuidv7_windows_test                     Windows CLI contract (not applicable elsewhere)
 tests/uuidv7_differential_test                Zig C ABI vs the LuaJIT core
 tests/uuidv7z_cli_test                        uuidv7z CLI vs the LuaJIT CLI
-tests/uuidv7_sysv_counter_test                Linux-only SysV test (reference; not in CI)
 alternates/uuidv7.{bash,sh}                   pure-bash / POSIX-sh references (not installed)
 src/uuidv7.zig              pure Zig core (port of lib/uuidv7_core.lua)
 src/ffi.zig, include/uuidv7.h   C ABI

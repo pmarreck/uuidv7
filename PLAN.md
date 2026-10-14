@@ -3,12 +3,16 @@
 Open work in priority order. Completed items: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Direction and done criteria: [intents/three_os_and_zig_port.md](intents/three_os_and_zig_port.md).
 
 ## Next (authorized, unblocked)
+- [ ] Fix: Linux LuaJIT CLI's SysV shared-memory counter is unlocked (16 processes x 60 at one ns: 5-10 duplicates in 960); use the flock'd counter file as on macOS
+- [ ] Windows daemon (BDFN chose C2, 2026-10-14): Winsock AF_UNIX + WSAPoll, Windows-compatible restart; daemon suites run on Windows
+- [ ] Shared machine-wide counter (BDFN goal 2026-10-14: monotonicity across the whole machine): uuidv7 and uuidv7z share one locked state file, and uuidv7z uses a running daemon
 - [x] Reproducible Windows test toolchain: flake output luajit-windows-x86_64 + import check, and ./test-windows runner (done 2026-10-14 14:32 EDT)
 
 ## Awaiting BDFN decisions (queued in the walking brief)
-- [ ] Decision uuidv7-os-rng-failure-policy: refuse to generate when the OS RNG fails, or keep the warn + insecure fallback (both implementations)
-- [ ] Decision uuidv7-windows-daemon-scope: keep Windows local-only, or port the daemon
-- [ ] Decision uuidv7-shared-counter-contract: share counter state between uuidv7 and uuidv7z, or keep separate streams
+- [ ] Decision uuidv7-os-rng-failure-policy revision 2 (queued 2026-10-14): fail closed or keep the warn + clock-seeded fallback when the OS RNG fails
+
+## Investigate
+- [ ] macOS: 24 concurrent `bin/uuidv7` launches via the `#!/usr/bin/env luajit` shebang fail with ENOMEM / SIGKILL at exec on one Mac under swap pressure (85% used); `luajit bin/uuidv7` never fails; cause unproven (2026-10-14)
 
 ## Blocked on hardware
 - [ ] Windows aarch64 runtime verification (needs a reachable ARM64 Windows host; compile + header check only so far)

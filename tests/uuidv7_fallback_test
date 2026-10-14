@@ -1,6 +1,6 @@
 #!/usr/bin/env luajit
 -- The daemon dispenses from its in-memory counter; the plain CLI uses the separate
--- fs/SysV counter. If the CLI silently generated locally while a daemon was running,
+-- locked-file counter. If the CLI silently generated locally while a daemon was running,
 -- the two independent streams could sort out of order -> the "strictly monotonic"
 -- guarantee would be violated. So: a REACHABLE daemon must serve every live request
 -- (with bounded, backed-off retries); the CLI must NEVER silently fall back to local

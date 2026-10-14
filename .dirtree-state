@@ -16,6 +16,7 @@ annotate=[
 	src/uuidv7_test.zig = Zig core unit tests incl. sorted sweep
 	test-windows = run the full ./test on a real Windows host over SSH (UUIDV7_WINDOWS_HOST)
 	tests/uuidv7_clock_test = injected-clock tests: monotonic+unique at 1ms/100ns/1ns ticks, backward steps, frozen clock, counter overflow
+	tests/uuidv7_concurrency_test = 24 concurrent local CLI processes at one ns: all unique, each stream strictly increasing
 	tests/uuidv7_differential_test = LuaJIT oracle vs Zig C ABI: encode, advance, extract, parse, round-trips, sorted sweep
 	tests/uuidv7_windows_test = Windows-only CLI contract: daemon refusal, secure RNG, LockFileEx counter ordering across processes
 	tests/uuidv7z_cli_test = CLI differential: uuidv7z vs LuaJIT uuidv7 (exit codes, stdout, stderr, ordering)

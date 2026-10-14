@@ -46,12 +46,17 @@ C ABI that other programs can embed.
   side did not author (round-trip, RFC 9562 bit layout, sorted-sweep ordering)
   are preferred.
 
+## Decisions
+
+- Ordering goal (BDFN, 2026-10-14): monotonicity across the entire machine, so
+  both implementations share one counter and the Zig CLI uses a running daemon.
+- Windows gets the daemon (BDFN, 2026-10-14): Winsock AF_UNIX sockets and WSAPoll,
+  with a Windows-compatible restart mechanism.
+
 ## Open questions
 
-- Windows daemon: unsupported (explicit refusal) or ported (AF_UNIX via Winsock,
-  or a named pipe)?
-- Should the Zig CLI share the LuaJIT CLI's cross-process counter state and
-  honor a running LuaJIT daemon, so mixing the two on one machine stays monotonic?
+- When the OS secure random source fails: refuse to generate, or warn and seed
+  the counter from the clock? (Ordering is unaffected either way.)
 
 See [PLAN.md](PLAN.md) for current work.
 - Direction and done criteria: [intents/three_os_and_zig_port.md](intents/three_os_and_zig_port.md)

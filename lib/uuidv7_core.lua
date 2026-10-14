@@ -1,5 +1,5 @@
 -- uuidv7 core: the single source of truth for RFC 9562 UUIDv7 generation.
--- Shared by the CLI (fs/sysv counter backends) and the daemon (in-memory backend).
+-- Shared by the CLI (locked-file counter backends) and the daemon (in-memory backend).
 -- Pure LuaJIT + FFI, zero dependencies.
 
 local ffi = require("ffi")
@@ -26,21 +26,16 @@ ffi.cdef[[
 	int ftruncate(int fd, off_t length);
 	int flock(int fd, int operation);
 	int mkdir(const char *pathname, mode_t mode);
-	typedef int key_t;
-	int shmget(key_t key, size_t size, int shmflg);
-	void *shmat(int shmid, const void *shmaddr, int shmflg);
-	int shmdt(const void *shmaddr);
 	long long strtoll(const char *nptr, char **endptr, int base);
-	static const int O_CREAT = 0x0200;
-	static const int O_RDWR = 0x0002;
 	static const int LOCK_EX = 2;
 	static const int LOCK_UN = 8;
 	static const int SEEK_SET = 0;
 	static const int CLOCK_REALTIME = 0;
-	static const int IPC_CREAT = 01000;
 ]]
 
 local C = ffi.C
+-- open(2) flags differ by platform; O_RDWR is 2 on both.
+local O_RDWR, O_CREAT = 0x0002, (jit.os == "OSX") and 0x0200 or 0x0040
 local M = {}
 
 M.VERSION = "0.2.0"
@@ -213,7 +208,7 @@ function MemoryCounter:get_next(current_nt, is_static, random_u64)
 	return eff, ctr, kind
 end
 
--- Filesystem (macOS CLI default): flock'd file under $TMPDIR, atomic cross-process RMW.
+-- Filesystem (Linux and macOS CLI default): flock'd file under $TMPDIR, atomic cross-process RMW.
 local FsCounter = {}
 FsCounter.__index = FsCounter
 function FsCounter:new()
@@ -221,7 +216,7 @@ function FsCounter:new()
 	return setmetatable({ filepath = tmp .. "/uuidv7-sequence", _nt = nil, _ctr = nil }, self)
 end
 function FsCounter:get_next(current_nt, is_static, random_u64)
-	local fd = C.open(self.filepath, bit.bor(C.O_CREAT, C.O_RDWR), ffi.new("int", 438))
+	local fd = C.open(self.filepath, bit.bor(O_CREAT, O_RDWR), ffi.new("int", 438))
 	if fd < 0 then
 		self._nt, self._ctr = advance(self._nt, self._ctr, current_nt, is_static, random_u64)
 		return self._nt, self._ctr, "new"
@@ -245,32 +240,6 @@ function FsCounter:get_next(current_nt, is_static, random_u64)
 	C.write(fd, out, #out)
 	C.flock(fd, C.LOCK_UN)
 	C.close(fd)
-	return eff, ctr, kind
-end
-
--- System V shared memory (Linux CLI default). Best-effort RMW (no semaphore).
-local SysVCounter = {}
-SysVCounter.__index = SysVCounter
-function SysVCounter:new() return setmetatable({ key = 0x75756964, _nt = nil, _ctr = nil }, self) end
-function SysVCounter:get_next(current_nt, is_static, random_u64)
-	local shmid = C.shmget(self.key, 16, bit.bor(C.IPC_CREAT, 438))
-	if shmid == -1 then
-		self._nt, self._ctr = advance(self._nt, self._ctr, current_nt, is_static, random_u64)
-		return self._nt, self._ctr, "new"
-	end
-	local ptr = C.shmat(shmid, nil, 0)
-	if ffi.cast("intptr_t", ptr) == ffi.cast("intptr_t", -1) then
-		self._nt, self._ctr = advance(self._nt, self._ctr, current_nt, is_static, random_u64)
-		return self._nt, self._ctr, "new"
-	end
-	local nt_ptr = ffi.cast("int64_t*", ptr)
-	local ctr_ptr = ffi.cast("uint64_t*", ffi.cast("char*", ptr) + 8)
-	local stored_nt, stored_ctr
-	if nt_ptr[0] ~= 0LL then stored_nt = nt_ptr[0]; stored_ctr = ctr_ptr[0] end
-	local eff, ctr, kind = advance(stored_nt, stored_ctr, current_nt, is_static, random_u64)
-	nt_ptr[0] = eff
-	ctr_ptr[0] = ctr
-	C.shmdt(ptr)
 	return eff, ctr, kind
 end
 
@@ -313,12 +282,11 @@ end
 
 function M.new_counter(backend)
 	if backend == "auto" or backend == nil then
-		backend = is_windows and "win" or (is_macos and "fs" or "sysv")
+		backend = is_windows and "win" or "fs"
 	end
 	if backend == "win" then return WinCounter:new() end
 	if backend == "memory" then return MemoryCounter:new()
 	elseif backend == "fs" then return FsCounter:new()
-	elseif backend == "sysv" then return SysVCounter:new()
 	end
 	error("uuidv7_core: unknown counter backend " .. tostring(backend))
 end

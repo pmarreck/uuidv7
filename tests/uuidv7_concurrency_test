@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Cross-process ordering of the local CLI (no daemon): many concurrent processes
+# minting at one explicit nanosecond must never duplicate a value, and each
+# process's own stream must be strictly increasing. Only the shared, exclusively
+# locked counter state can make this hold; an unlocked read-modify-write races.
+set -u
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PATH="$here/../bin:$PATH"
+export UUIDV7_NO_DAEMON=1
+TMPDIR="$(mktemp -d)"; export TMPDIR
+trap 'rm -rf "$TMPDIR"' EXIT
+
+workers=24 per=50 ts=1700000000000000000
+tests=0 fails=0
+check() {
+	tests=$((tests + 1))
+	if eval "$2"; then echo "✓ $1"; else fails=$((fails + 1)); echo "✗ $1" >&2; fi
+}
+
+mkdir -p "$TMPDIR/out"
+for w in $(seq 1 "$workers"); do
+	# Run the script through luajit directly: this tests counter locking, not
+	# shebang exec (concurrent env-shebang execs fail on one macOS host; see PLAN.md).
+	( for i in $(seq 1 "$per"); do luajit "$here/../bin/uuidv7" "$ts"; done > "$TMPDIR/out/$w" ) &
+done
+wait
+
+all="$(find "$TMPDIR/out" -type f -exec cat {} +)"
+total="$(printf '%s\n' "$all" | grep -c .)"
+uniq_n="$(printf '%s\n' "$all" | sort -u | grep -c .)"
+check "$workers concurrent processes x $per: $total values" "[ $total -eq $((workers * per)) ]"
+check "all $total values unique ($uniq_n distinct)" "[ $uniq_n -eq $total ]"
+unordered=0
+for f in $(find "$TMPDIR/out" -type f); do
+	prev=""
+	while read -r u; do
+		if [ -n "$prev" ] && ! [[ "$u" > "$prev" ]]; then unordered=$((unordered + 1)); fi
+		prev="$u"
+	done < "$f"
+done
+check "every process's own stream strictly increasing" "[ $unordered -eq 0 ]"
+
+echo "$((tests - fails))/$tests concurrency tests passed"
+[ "$fails" -eq 0 ]
