@@ -7,9 +7,10 @@
 -- listening, so we synchronize on that event (initial start AND after re-exec). io.popen
 -- gives us the child handle, so shutdown is confirmed by stdout EOF, not a timer.
 
-local self_dir = (arg and arg[0] or ""):match("^(.*)/[^/]+$") or "."
+local self_dir = (arg and arg[0] or ""):match("^(.*)[/\\][^/\\]+$") or "."
 package.path = self_dir .. "/../lib/?.lua;" .. package.path
 local client = require("uuidv7_client")
+local sh = dofile(self_dir .. "/uuidv7_testsh.lua")   -- POSIX command lines on every OS
 
 local tests, fails = 0, 0
 local function ok(name, cond, detail)
@@ -22,9 +23,9 @@ local function ok(name, cond, detail)
 	end
 end
 
-local base = (os.getenv("TMPDIR") or "/tmp"):gsub("/+$", "")
+local base = (os.getenv("TMPDIR") or os.getenv("TEMP") or "/tmp"):gsub("/+$", "")
 local run = base .. "/uuidv7_dtest_" .. tostring(os.time())
-os.execute("mkdir -p '" .. run .. "'")
+sh.execute("mkdir -p '" .. run .. "'")
 local sock = run .. "/d.sock"
 local logf = run .. "/d.log"
 local exe = self_dir .. "/../bin/uuidv7"
@@ -36,7 +37,7 @@ local function start_daemon()
 	local cmd = string.format(
 		"env UUIDV7_SOCK=%q UUIDV7_LOG=%q LUA_PATH=%q UUIDV7_SILENCE_INSECURE_RANDOM=1 %q --daemon 2>%q",
 		sock, logf, libp, exe, derrf)
-	dh = io.popen(cmd, "r")
+	dh = sh.popen(cmd, "r")
 end
 local function dump_daemon_stderr()
 	local f = io.open(derrf, "r"); if not f then return end
@@ -59,6 +60,7 @@ end
 local function is_uuid_compact(u) return type(u) == "string" and #u == 32 and u:sub(13, 13) == "7" end
 
 local pid
+local stopped = false   -- set once the daemon has exited on +++
 local function body()
 	start_daemon()
 	ok("daemon announces listening", wait_ready())
@@ -150,9 +152,9 @@ local function body()
 	-- log to file + injection attempt, then validate the whole log is JSONL
 	ok("l -> OK", req("l") == "OK\n")
 	req('x"}q')   -- a token that would corrupt the log if not JSON-escaped
-	if os.execute("command -v jq >/dev/null 2>&1") then
-		local rc = os.execute("jq . '" .. logf .. "' >/dev/null 2>&1")
-		ok("every log line is valid JSON (jq)", rc == true or rc == 0)
+	if sh.execute("command -v jq >/dev/null 2>&1") then
+		local rc = sh.execute("jq . '" .. logf .. "' >/dev/null 2>&1")
+		ok("every log line is valid JSON (jq)", rc)
 	else
 		local good = true
 		for l in io.lines(logf) do if not (l:match("^{.*}$") and l:match('"event":')) then good = false end end
@@ -162,7 +164,7 @@ local function body()
 	-- CLI fast-path: plain `uuidv7` (NO_DAEMON unset) should route to the daemon
 	do
 		local before = tonumber((req("sj")):match('"uuids_served":(%d+)'))
-		local h = io.popen(string.format("env UUIDV7_SOCK=%q LUA_PATH=%q %q 2>/dev/null", sock, libp, exe), "r")
+		local h = sh.popen(string.format("env UUIDV7_SOCK=%q LUA_PATH=%q %q 2>/dev/null", sock, libp, exe), "r")
 		local out = h:read("*l"); h:close()
 		local after = tonumber((req("sj")):match('"uuids_served":(%d+)'))
 		ok("CLI routes live generation to the daemon", is_uuid_compact(out) and after > before,
@@ -171,7 +173,7 @@ local function body()
 
 	-- --api flag: CLI sends a raw protocol line and prints the reply
 	do
-		local h = io.popen(string.format("env UUIDV7_SOCK=%q LUA_PATH=%q %q --api c5 2>/dev/null", sock, libp, exe), "r")
+		local h = sh.popen(string.format("env UUIDV7_SOCK=%q LUA_PATH=%q %q --api c5 2>/dev/null", sock, libp, exe), "r")
 		local out = h:read("*a"); h:close()
 		ok("--api c5 returns 5 uuids", #lines_of(out) == 5, out)
 	end
@@ -184,16 +186,22 @@ local function body()
 	pid = (req("sj") or ""):match('"pid":(%d+)')   -- same pid (re-exec), refresh anyway
 
 	-- shutdown: +++ -> OK, daemon exits (stdout EOF), socket removed
-	ok("+++ -> OK", req("+++") == "OK\n")
-	dh:read("*a")          -- drain to EOF (blocks until the daemon's stdout closes = exited)
+	local shut = req("+++") == "OK\n"
+	ok("+++ -> OK", shut)
+	-- Drain to EOF (blocks until the daemon's stdout closes = exited) only when the
+	-- daemon accepted the shutdown; otherwise the backstop below stops it.
+	if shut then dh:read("*a"); stopped = true end
 	ok("socket gone after shutdown", client.open(sock) == nil)
 end
 
 local okrun, err = pcall(body)
 dump_daemon_stderr()
+-- Backstop if a test failed before shutdown: stop the daemon BEFORE closing the
+-- pipe, since closing it waits for the daemon to exit (on Windows, too).
+if pid and not stopped then sh.kill(pid) end
 if dh then pcall(function() dh:close() end) end
-if pid then os.execute("kill " .. pid .. " 2>/dev/null") end   -- backstop if a test crashed
-os.execute("rm -rf '" .. run .. "' 2>/dev/null")
+sh.execute("rm -rf '" .. run .. "' 2>/dev/null")
+sh.cleanup()
 if not okrun then io.stderr:write("daemon test crashed: " .. tostring(err) .. "\n"); os.exit(1) end
 if fails > 0 then io.stderr:write(fails .. " of " .. tests .. " daemon tests failed!\n"); os.exit(1) end
 io.write("All " .. tests .. " daemon tests passed!\n")

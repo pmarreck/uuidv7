@@ -13,9 +13,10 @@
 -- Deterministic + reproducible: seed from UUIDV7_FUZZ_SEED (printed on every run), so
 -- any failure can be replayed exactly. Iterations via UUIDV7_FUZZ_ITERS (default 600).
 
-local self_dir = (arg and arg[0] or ""):match("^(.*)/[^/]+$") or "."
+local self_dir = (arg and arg[0] or ""):match("^(.*)[/\\][^/\\]+$") or "."
 package.path = self_dir .. "/../lib/?.lua;" .. package.path
 local client = require("uuidv7_client")
+local sh = dofile(self_dir .. "/uuidv7_testsh.lua")   -- POSIX command lines on every OS
 
 local tests, fails = 0, 0
 local function ok(name, cond, detail)
@@ -29,9 +30,9 @@ local iters = tonumber(os.getenv("UUIDV7_FUZZ_ITERS") or "") or 600
 math.randomseed(seed)
 io.write(string.format("fuzz seed=%d iters=%d (override via UUIDV7_FUZZ_SEED / UUIDV7_FUZZ_ITERS)\n", seed, iters))
 
-local base = (os.getenv("TMPDIR") or "/tmp"):gsub("/+$", "")
+local base = (os.getenv("TMPDIR") or os.getenv("TEMP") or "/tmp"):gsub("/+$", "")
 local run = base .. "/uuidv7_fuzz_" .. tostring(os.time()) .. "_" .. tostring(seed)
-os.execute("mkdir -p '" .. run .. "'")
+sh.execute("mkdir -p '" .. run .. "'")
 local sock = run .. "/d.sock"
 local logf = run .. "/d.log"
 local exe = self_dir .. "/../bin/uuidv7"
@@ -41,11 +42,12 @@ local derrf = run .. "/derr"
 local cmd = string.format(
 	"env UUIDV7_SOCK=%q UUIDV7_LOG=%q LUA_PATH=%q UUIDV7_SILENCE_INSECURE_RANDOM=1 %q --daemon 2>%q",
 	sock, logf, libp, exe, derrf)
-local dh = io.popen(cmd, "r")
+local dh = sh.popen(cmd, "r")
 local function wait_ready()
 	while true do local l = dh:read("*l"); if not l then return false end; if l:match("^UUIDV7%-LISTENING") then return true end end
 end
 ok("daemon announces listening", wait_ready())
+local pid = (client.oneshot(sock, "sj") or ""):match('"pid":(%d+)')
 
 local function is_uuid_compact(u) return type(u) == "string" and #u == 32 and u:sub(13, 13) == "7" end
 local function rand_bytes(n) local t = {}; for i = 1, n do t[i] = string.char(math.random(0, 255)) end; return table.concat(t) end
@@ -119,8 +121,8 @@ ok("status still queryable after fuzzing", sj:match('"event":"stats"') ~= nil an
 
 -- Probe 4: the log survived injection attempts as valid JSONL.
 client.oneshot(sock, "l")
-if os.execute("command -v jq >/dev/null 2>&1") then
-	local rc = os.execute("jq . '" .. logf .. "' >/dev/null 2>&1")
+if sh.execute("command -v jq >/dev/null 2>&1") then
+	local rc = sh.execute("jq . '" .. logf .. "' >/dev/null 2>&1")
 	ok("log is valid JSON after injection attempts (jq)", rc == true or rc == 0)
 else
 	local good = true
@@ -129,13 +131,17 @@ else
 end
 
 -- Shut the daemon down and confirm it left no traceback on stderr.
-client.oneshot(sock, "+++")
-dh:read("*a"); dh:close()
+-- If the daemon refuses +++, stop it by PID first: closing the pipe waits for it.
+local shut = client.oneshot(sock, "+++") == "OK\n"
+ok("+++ -> OK", shut)
+if shut then dh:read("*a") elseif pid then sh.kill(pid) end
+dh:close()
 local derr = ""
 do local f = io.open(derrf, "r"); if f then derr = f:read("*a") or ""; f:close() end end
 ok("daemon left no crash/traceback on stderr", #derr == 0, derr:sub(1, 200))
 
-os.execute("rm-safe '" .. run .. "' >/dev/null 2>&1 || rm -rf '" .. run .. "' 2>/dev/null")
+sh.execute("rm-safe '" .. run .. "' >/dev/null 2>&1 || rm -rf '" .. run .. "' 2>/dev/null")
+sh.cleanup()
 if fails > 0 then io.stderr:write(fails .. " of " .. tests .. " fuzz tests failed (replay with UUIDV7_FUZZ_SEED=" .. seed .. ")\n")
 else io.write("All " .. tests .. " fuzz tests passed!\n") end
 os.exit(fails)

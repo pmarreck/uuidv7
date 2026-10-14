@@ -12,7 +12,7 @@
 -- (client.oneshot) and injecting a fake sleep + deterministic jitter, so it is fast and
 -- deterministic and needs no real socket.
 
-local self_dir = (arg and arg[0] or ""):match("^(.*)/[^/]+$") or "."
+local self_dir = (arg and arg[0] or ""):match("^(.*)[/\\][^/\\]+$") or "."
 package.path = self_dir .. "/../lib/?.lua;" .. package.path
 local client = require("uuidv7_client")
 

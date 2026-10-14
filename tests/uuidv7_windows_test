@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Windows-only CLI contract (run under Git Bash/MSYS with a native luajit.exe):
-# no daemon by design, secure RNG (no insecure-fallback warning), and a
-# LockFileEx-locked counter file that keeps separate processes strictly ordered.
+# secure RNG (no insecure-fallback warning) and a LockFileEx-locked counter file
+# that keeps separate processes strictly ordered.
 set -u
 
 case "$(uname -s)" in
@@ -19,14 +19,12 @@ pass() { tests=$((tests + 1)); echo "✓ $1"; }
 fail() { tests=$((tests + 1)); fails=$((fails + 1)); echo "✗ $1" >&2; }
 check() { if eval "$2"; then pass "$1"; else fail "$1 [$2]"; fi; }
 
-capture uuidv7 --daemon
-check "--daemon refuses on Windows (exit 1)" '[ "$rc" -eq 1 ]'
-check "--daemon refusal names Windows" '[[ "$err" == *"not supported on Windows"* ]]'
-check "--daemon prints nothing on stdout" '[ -z "$out" ]'
-
-capture uuidv7 --api s
-check "--api refuses on Windows (exit 1)" '[ "$rc" -eq 1 ]'
-check "--api refusal names Windows" '[[ "$err" == *"not supported on Windows"* ]]'
+# The daemon itself is exercised by the daemon suites; with none running, --api
+# reports that exactly as on Unix.
+UUIDV7_SOCK="$TMPDIR/absent.sock" capture uuidv7 --api s
+check "--api with no daemon exits 1" '[ "$rc" -eq 1 ]'
+check "--api with no daemon says so" '[[ "$err" == *"no daemon reachable"* ]]'
+check "--api with no daemon prints nothing on stdout" '[ -z "$out" ]'
 
 capture uuidv7
 check "plain generation succeeds" '[ "$rc" -eq 0 ]'
@@ -34,7 +32,7 @@ check "plain generation is 32 hex" '[[ "$out" =~ ^[0-9a-f]{32}$ ]]'
 check "no stderr (secure RNG, no fallback warning)" '[ -z "$err" ]'
 
 capture env -u UUIDV7_NO_DAEMON uuidv7 --hyphen
-check "generation without UUIDV7_NO_DAEMON succeeds (no daemon probe)" '[ "$rc" -eq 0 ] && [ -z "$err" ]'
+check "generation without UUIDV7_NO_DAEMON succeeds (no daemon running)" '[ "$rc" -eq 0 ] && [ -z "$err" ]'
 check "generation without UUIDV7_NO_DAEMON is a hyphenated uuid" '[[ "$out" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]'
 
 capture uuidv7 --hyphen 1700000000000000123

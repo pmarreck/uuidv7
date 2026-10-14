@@ -73,14 +73,14 @@ Run `uuidv7 --help` for the full list.
 |---|---|---|---|
 | Linux x86_64 | yes, with daemon | yes (static musl) | `./test` on real hardware and in `nix flake check` (Mechatron Prime CI) |
 | macOS aarch64 | yes, with daemon | yes | `./test` on a real Apple-silicon Mac (macOS 26.7) |
-| Windows x86_64 | yes, no daemon | yes | `./test` under Git Bash on real Windows 10, with a static mingw LuaJIT and cross-compiled `uuidv7z.exe`/`uuidv7.dll` |
+| Windows x86_64 | yes, with daemon | yes | `./test` under Git Bash on real Windows 10, with a static mingw LuaJIT and cross-compiled `uuidv7z.exe`/`uuidv7.dll` |
 | Linux aarch64 | expected (not run) | yes (static musl) | QEMU user-mode emulation on x86_64: the Zig unit tests and the `uuidv7z` CLI differential pass; no run on real aarch64 Linux hardware |
 | Windows aarch64 | expected (not run) | cross-compiled | build and file-header check only (`./build-all`) |
 
 On Windows the clock is `GetSystemTimePreciseAsFileTime` (100 ns ticks; the counter keeps
 values strictly ordered within a tick), randomness comes from `BCryptGenRandom`, and the
-daemon is not available: `--daemon` and `--api` exit 1 with an explanation, and the
-plain CLI always generates locally. Coarse clocks are covered by
+daemon runs on Winsock's Unix-domain sockets (Windows 10 version 1803 or later); see
+[Daemon](#daemon) for the differences. Coarse clocks are covered by
 `tests/uuidv7_clock_test`, which injects 1 ms, 100 ns and 1 ns clocks, including clocks
 that step backward, and requires strictly increasing, unique output.
 
@@ -115,7 +115,15 @@ serve JavaScript hosts that cannot run LuaJIT; no such integration exists yet.
 ## Daemon
 
 `uuidv7 --daemon` runs a single-threaded, `poll(2)`-based **Unix-domain-socket** server
-(`${XDG_RUNTIME_DIR:-$TMPDIR}/uuidv7.sock`, mode `0600`). Because it's one process, the
+(`${XDG_RUNTIME_DIR:-$TMPDIR}/uuidv7.sock`, mode `0600`). On Windows it uses Winsock's
+AF_UNIX sockets and `WSAPoll` (Windows 10 version 1803 or later), with the socket in
+`%TMPDIR%` or `%TEMP%` and the log in `%LOCALAPPDATA%\uuidv7\uuidv7.log`. Three things
+differ there. Access control comes from the per-user temp directory, because Winsock has
+no file mode or peer-credential call for these sockets, so the log records no peer UID.
+Restart (`r`) hands the open listener to a new process instead of re-executing in place,
+so the PID changes. Ctrl-C ends the daemon immediately rather than running its shutdown
+logging, and the next start replaces the stale socket file. All OS-specific calls live in
+`lib/uuidv7_net.lua`. Because it's one process, the
 counter is in-memory and strictly monotonic with no cross-process coordination at all.
 The plain `uuidv7` CLI **transparently uses the daemon** for live generation when its
 socket is reachable (no auto-spawn). When a daemon *is* reachable it is authoritative: the
@@ -209,8 +217,8 @@ extraction, the daemon retry / no-silent-fallback policy, a **load test** (many 
 clients; gates on correctness invariants only — zero duplicates, strictly-ascending
 per-connection streams, client↔server count reconciliation, no crashes — never on
 timing), and a **fuzz test** (hostile/malformed/partial protocol input; seeded and
-reproducible). On Windows, the four daemon suites are reported as not applicable and
-`tests/uuidv7_windows_test` runs instead. Everything also runs under `nix flake check`,
+reproducible). All of these run on Windows too, along with `tests/uuidv7_windows_test`.
+Everything also runs under `nix flake check`,
 which Mechatron Prime CI (the
 project's continuous-integration service) builds for every push. Raw throughput/latency lives in `bench/uuidv7_bench`, kept out of the
 pass/fail suites so loaded CI never makes them flaky.

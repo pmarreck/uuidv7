@@ -28,7 +28,7 @@ fi
 
 stage="$(mktemp -d)"
 trap 'mv "$stage" "$HOME/.Trash/uuidv7-test-windows-$$" 2>/dev/null' EXIT
-git ls-files -co --exclude-standard | tar -cf "$stage/src.tar" -T -
+git ls-files -co --exclude-standard | grep -v '^MECHATRON_PRIME_CI.md$' | tar -cf "$stage/src.tar" -T -
 mkdir -p "$stage/winbin"
 cp "$luajit_out/bin/luajit.exe" "zig-out/$triple/ReleaseFast/bin/uuidv7z.exe" \
 	"zig-out/$triple/ReleaseFast/bin/uuidv7.dll" "$stage/winbin/"

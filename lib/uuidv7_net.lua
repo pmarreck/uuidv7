@@ -199,6 +199,7 @@ local function windows()
 		uint32_t GetCurrentProcessId(void);
 		uint32_t GetModuleFileNameA(void *module, char *buf, uint32_t size);
 		int SetEnvironmentVariableA(const char *name, const char *value);
+		void *GetStdHandle(uint32_t which);
 		void Sleep(uint32_t ms);
 		int QueryPerformanceCounter(int64_t *count);
 		int QueryPerformanceFrequency(int64_t *freq);
@@ -293,6 +294,15 @@ local function windows()
 	function M.handoff(ln, exe)
 		local s = sock(ln)
 		set_inherit(s, true)
+		-- The successor must write to the same stdout (supervisors wait on its
+		-- readiness line), but a parent such as Git Bash may hand us standard
+		-- handles that are not inheritable. Make stdin/stdout/stderr inheritable.
+		for _, which in ipairs({ -10, -11, -12 }) do
+			local h = C.GetStdHandle(ffi.cast("uint32_t", which))
+			if h ~= nil and ffi.cast("intptr_t", h) ~= -1 then
+				C.SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
+			end
+		end
 		C.SetEnvironmentVariableA("UUIDV7_LISTEN_FD", tostring(ln))
 		local buf = ffi.new("char[1024]")
 		local len = C.GetModuleFileNameA(nil, buf, 1024)

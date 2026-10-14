@@ -40,14 +40,8 @@ fi
 "$here/tests/uuidv7_windows_test" || rc=$?   # Windows CLI contract (n/a elsewhere)
 "$here/tests/uuidv7_differential_test" || rc=$?   # Zig core vs LuaJIT oracle through the C ABI
 "$here/tests/uuidv7z_cli_test"  || rc=$?   # uuidv7z CLI vs LuaJIT CLI
-if [ "$windows" -eq 1 ]; then
-	# The daemon is Unix-only by design (Unix-domain socket, poll(2), re-exec);
-	# uuidv7_windows_test asserts that --daemon and --api refuse on Windows.
-	echo "n/a on Windows (no daemon by design): uuidv7_daemon_test uuidv7_fallback_test uuidv7_load_test uuidv7_fuzz_test"
-else
-	"$here/tests/uuidv7_daemon_test" || rc=$?   # UDS daemon (black-box)
-	"$here/tests/uuidv7_fallback_test" || rc=$?   # daemon retry / no-silent-fallback policy
-	"$here/tests/uuidv7_load_test"    || rc=$?   # concurrency invariants under load (no perf gating)
-	"$here/tests/uuidv7_fuzz_test"    || rc=$?   # hostile/malformed protocol input (robustness)
-fi
+"$here/tests/uuidv7_daemon_test" || rc=$?   # UDS daemon (black-box)
+"$here/tests/uuidv7_fallback_test" || rc=$?   # daemon retry / no-silent-fallback policy
+"$here/tests/uuidv7_load_test"    || rc=$?   # concurrency invariants under load (no perf gating)
+"$here/tests/uuidv7_fuzz_test"    || rc=$?   # hostile/malformed protocol input (robustness)
 exit "$rc"
