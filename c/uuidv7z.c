@@ -35,7 +35,7 @@
 #endif
 
 #define PROG "uuidv7z"
-#define STATE_FILE "uuidv7z-sequence"
+#define STATE_FILE "uuidv7-sequence"
 
 #if defined(__x86_64__) || defined(_M_X64)
 #define ARCH "x86_64"
@@ -247,7 +247,7 @@ static void show_help(void) {
 		"  argument is an error.\n"
 		"\n"
 		"Strict ordering across processes comes from an exclusively locked counter file,\n"
-		"$TMPDIR/uuidv7z-sequence (Windows: %TMPDIR%, %TEMP% or %TMP%). The daemon\n"
+		"$TMPDIR/uuidv7-sequence (Windows: %TMPDIR%, %TEMP% or %TMP%). The daemon\n"
 		"(--daemon, --api) exists only in the LuaJIT `uuidv7`.\n"
 		"Env: TMPDIR, UUIDV7_NS_EXTRACT_OK, UUIDV7_SILENCE_INSECURE_RANDOM.\n"
 		"\n"

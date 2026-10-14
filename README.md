@@ -95,9 +95,10 @@ bin/linux/x86_64/uuidv7z --hyphen
 
 `uuidv7z` accepts the same arguments and produces the same results as `uuidv7`, except
 that it has no daemon (`--daemon`/`--api` are refused) and no `--test`, and `--about`
-prints its version and platform. It keeps its own cross-process counter in
-`$TMPDIR/uuidv7z-sequence`, so values from `uuidv7` and `uuidv7z` running on one
-machine are each strictly ordered, but not ordered with respect to each other.
+prints its version and platform. Both CLIs share one exclusively locked counter
+file, `$TMPDIR/uuidv7-sequence` (same `<nanotime>:<counter>` text and the same
+`flock`/`LockFileEx` locking), so values from `uuidv7` and `uuidv7z` processes on
+one machine are strictly ordered with respect to each other.
 
 The pieces:
 

@@ -131,7 +131,27 @@ n=$(ordered_run 1700000000000000000)
 check "uuidv7z: 60 processes at one static ns strictly increasing ($n/60)" '[ "$n" = 60 ]'
 n=$(ordered_run)
 check "uuidv7z: 60 live processes strictly increasing ($n/60)" '[ "$n" = 60 ]'
-check "uuidv7z: counter state file is in TMPDIR (path with a space)" '[ -s "$TMPDIR/uuidv7z-sequence" ]'
+check "uuidv7z: counter state file is in TMPDIR (path with a space)" '[ -s "$TMPDIR/uuidv7-sequence" ]'
+# Both CLIs share one locked state file, so machine-wide ordering holds even
+# when the two implementations alternate.
+# mixed_run <args...>: 60 processes alternating uuidv7 and uuidv7z; prints how
+# many were well-formed and strictly greater than their predecessor.
+mixed_run() {
+	local prev="" cur good=0
+	for i in $(seq 1 30); do
+		for impl in lua zig; do
+			if [ "$impl" = lua ]; then cur="$("${lua_cli[@]}" "$@")"; else cur="$("$zig_cli" "$@")"; fi
+			if [[ "$cur" =~ ^[0-9a-f]{32}$ ]] && [[ "$cur" > "$prev" ]]; then good=$((good + 1)); fi
+			prev="$cur"
+		done
+	done
+	echo "$good"
+}
+n=$(mixed_run 1700000000000000000)
+check "uuidv7 + uuidv7z alternating at one static ns strictly increasing ($n/60)" '[ "$n" = 60 ]'
+n=$(mixed_run)
+check "uuidv7 + uuidv7z alternating live strictly increasing ($n/60)" '[ "$n" = 60 ]'
+check "no separate uuidv7z state file" '[ ! -e "$TMPDIR/uuidv7z-sequence" ]'
 for w in 1 2 3 4 5 6 7 8; do
 	( for i in $(seq 1 20); do "$zig_cli" 1700000000000000000; done > "$TMPDIR/w$w" ) &
 done
@@ -139,6 +159,15 @@ wait
 all="$(cat "$TMPDIR"/w1 "$TMPDIR"/w2 "$TMPDIR"/w3 "$TMPDIR"/w4 "$TMPDIR"/w5 "$TMPDIR"/w6 "$TMPDIR"/w7 "$TMPDIR"/w8)"
 check "uuidv7z: 8 concurrent workers x 20 = 160 values" '[ "$(printf "%s\n" "$all" | wc -l)" -eq 160 ]'
 check "uuidv7z: 8 concurrent workers x 20 all unique" '[ "$(printf "%s\n" "$all" | sort -u | wc -l)" -eq 160 ]'
+# Mixed contention: odd workers run uuidv7, even workers uuidv7z, all at one ns.
+for w in 1 2 3 4 5 6 7 8; do
+	if [ $((w % 2)) -eq 1 ]; then cli=("${lua_cli[@]}"); else cli=("$zig_cli"); fi
+	( for i in $(seq 1 20); do "${cli[@]}" 1700000000000000000; done > "$TMPDIR/m$w" ) &
+done
+wait
+all="$(cat "$TMPDIR"/m1 "$TMPDIR"/m2 "$TMPDIR"/m3 "$TMPDIR"/m4 "$TMPDIR"/m5 "$TMPDIR"/m6 "$TMPDIR"/m7 "$TMPDIR"/m8)"
+check "uuidv7 + uuidv7z: 8 mixed concurrent workers x 20 = 160 values" '[ "$(printf "%s\n" "$all" | wc -l)" -eq 160 ]'
+check "uuidv7 + uuidv7z: 8 mixed concurrent workers x 20 all unique" '[ "$(printf "%s\n" "$all" | sort -u | wc -l)" -eq 160 ]'
 
 # ---- uuidv7z-specific surface ----
 run Z "$zig_cli" --about
