@@ -337,5 +337,114 @@ do
 	check("library version matches the LuaJIT core", ffi.string(v, vlen[0]) == core.VERSION, ffi.string(v, vlen[0]))
 end
 
+-- ---------- 7. daemon client retry policy vs client.try_daemon ----------
+-- Seeded scenarios: a run of refused replies (empty or ERR), optionally ending in
+-- a served one, under random attempt caps, wait budgets and jitter draws. The Lua
+-- decision layer runs against a stubbed transport and a recording sleep; the Zig
+-- policy runs through the C ABI on the same replies and jitter. Request lines,
+-- sleeps and the outcome must agree.
+do
+	local client = require("uuidv7_client")
+	local real_oneshot = client.oneshot
+	local retry = ffi.new("uuidv7_retry[1]")
+	local nxt = ffi.new("uuidv7_retry[1]")
+	local action = ffi.new("uint8_t[1]")
+	local slept_out = ffi.new("uint64_t[1]")
+	local line_buf = ffi.new("char[?]", H.UUIDV7_RETRY_REQUEST_MAX)
+
+	local function zig_run(replies, hyphen, cap, timeout, jitters)
+		local lines, sleeps, j = {}, {}, 0
+		Z.uuidv7_retry_init(retry)
+		local i = 0
+		while true do
+			i = i + 1
+			assert(Z.uuidv7_retry_request(retry, hyphen and 1 or 0, line_buf, H.UUIDV7_RETRY_REQUEST_MAX, len_out) == H.UUIDV7_OK)
+			lines[#lines + 1] = ffi.string(line_buf, len_out[0])
+			local resp = replies[math.min(i, #replies)]
+			if Z.uuidv7_reply_served(resp, #resp) == 1 then return "emit", lines, sleeps end
+			j = j + 1
+			local jit_v = jitters[j]
+			assert(Z.uuidv7_retry_after_refusal(retry, cap, timeout, jit_v, nxt, action, slept_out) == H.UUIDV7_OK)
+			if action[0] == H.UUIDV7_RETRY_GIVE_UP_ATTEMPTS then return "attempts", lines, sleeps end
+			if action[0] == H.UUIDV7_RETRY_GIVE_UP_TIMEOUT then return "timeout", lines, sleeps end
+			sleeps[#sleeps + 1] = tonumber(slept_out[0])
+			retry[0] = nxt[0]
+		end
+	end
+
+	local function lua_run(replies, hyphen, cap, timeout, jitters)
+		local lines, sleeps, j = {}, {}, 0
+		client.oneshot = function(_, line)
+			lines[#lines + 1] = line
+			return replies[math.min(#lines, #replies)]
+		end
+		local a, msg = client.try_daemon(hyphen and { "--hyphen" } or {}, {
+			attempts = cap, timeout_us = timeout,
+			sleep = function(us) sleeps[#sleeps + 1] = us end,
+			rand = function() j = j + 1; return jitters[j] end,
+		})
+		if a == "error" then a = msg:match("retry timeout") and "timeout" or "attempts" end
+		return a, lines, sleeps
+	end
+
+	local refusals = { "", "ERR busy\n", "ERR\n" }
+	local bad, first_bad = 0, nil
+	local N = 3000 * SCALE
+	for n = 1, N do
+		local k = randint(30)
+		local replies = {}
+		for i = 1, k do replies[i] = refusals[randint(#refusals) + 1] end
+		if randint(2) == 0 then replies[#replies + 1] = "017f22e279b077ffbfc90c9a45e78a47\n" end
+		if #replies == 0 then replies[1] = "" end
+		local cap = randint(25) + 1
+		local timeout = randint(6000)
+		local jitters = {}
+		for i = 1, 40 do jitters[i] = tonumber(rand64() % 1000000ULL) / 1000000 end
+		local hyphen = randint(2) == 0
+		local za, zl, zs = zig_run(replies, hyphen, cap, timeout, jitters)
+		local la, ll, ls = lua_run(replies, hyphen, cap, timeout, jitters)
+		local same = za == la and table.concat(zl, "|") == table.concat(ll, "|") and table.concat(zs, ",") == table.concat(ls, ",")
+		if not same then
+			bad = bad + 1
+			first_bad = first_bad or ("cap=%d timeout=%d zig=%s [%s] (%s) lua=%s [%s] (%s)"):format(cap, timeout,
+				za, table.concat(zl, "|"), table.concat(zs, ","), la, table.concat(ll, "|"), table.concat(ls, ","))
+		end
+	end
+	client.oneshot = real_oneshot
+	check(("retry policy agrees with try_daemon over %d seeded scenarios"):format(N), bad == 0, first_bad)
+
+	-- Environment configuration, with os.getenv stubbed per case.
+	local real_getenv = os.getenv
+	local u32_out, u64_out = ffi.new("uint32_t[1]"), ffi.new("uint64_t[1]")
+	local env_bad, env_first = 0, nil
+	local values = { false, "", "0", "1", "5", "20", "true", "TRUE", "yes", "abc", "-5", "750", "4294967295" }
+	for _, nr in ipairs(values) do
+		for _, rt in ipairs(values) do
+			local env = { UUIDV7_DAEMON_NO_RETRY = nr or nil, UUIDV7_DAEMON_RETRIES = rt or nil, UUIDV7_DAEMON_RETRY_TIMEOUT_US = rt or nil }
+			os.getenv = function(name) return env[name] end
+			local la, lt = client.retry_attempts(), client.retry_timeout_us()
+			os.getenv = real_getenv
+			local nrs, rts = nr or "", rt or ""
+			assert(Z.uuidv7_retry_attempts(nrs, #nrs, rts, #rts, u32_out) == H.UUIDV7_OK)
+			assert(Z.uuidv7_retry_timeout_us(rts, #rts, u64_out) == H.UUIDV7_OK)
+			if la ~= tonumber(u32_out[0]) or lt ~= tonumber(u64_out[0]) then
+				env_bad = env_bad + 1
+				env_first = env_first or ("NO_RETRY=%s RETRIES/TIMEOUT=%s: lua %s/%s zig %s/%s"):format(
+					tostring(nr), tostring(rt), la, lt, tostring(u32_out[0]), tostring(u64_out[0]))
+			end
+		end
+	end
+	check("retry configuration from the environment agrees with the LuaJIT client", env_bad == 0, env_first)
+	check("retry_after_refusal refuses jitter outside [0, 1)",
+		Z.uuidv7_retry_after_refusal(retry, 20, 2000, 1.0, nxt, action, slept_out) == H.UUIDV7_ERR_RANGE
+		and Z.uuidv7_retry_after_refusal(retry, 20, 2000, -0.1, nxt, action, slept_out) == H.UUIDV7_ERR_RANGE
+		and Z.uuidv7_retry_after_refusal(retry, 20, 2000, 0/0, nxt, action, slept_out) == H.UUIDV7_ERR_RANGE)
+	check("retry config refuses NULL text with a nonzero length",
+		Z.uuidv7_retry_attempts(nil, 1, nil, 0, u32_out) == H.UUIDV7_ERR_NULL
+		and Z.uuidv7_retry_timeout_us(nil, 1, u64_out) == H.UUIDV7_ERR_NULL)
+	check("retry_request refuses a short buffer",
+		Z.uuidv7_retry_request(retry, 1, line_buf, 0, len_out) == H.UUIDV7_ERR_BUFFER)
+end
+
 io.write(("%d/%d differential tests passed\n"):format(tests - fails, tests))
 os.exit(fails == 0 and 0 or 1)

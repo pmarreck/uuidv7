@@ -163,3 +163,74 @@ fn isDecimal(text: []const u8) bool {
 	for (text) |c| if (c < '0' or c > '9') return false;
 	return true;
 }
+
+// ---- daemon client retry policy (port of try_daemon in lib/uuidv7_client.lua) ----
+// A reachable daemon owns the live stream, so a client that gets an empty or ERR
+// reply retries the daemon with bounded, growing backoff and never generates
+// locally. The caller does the socket I/O, the sleeping and the jitter draw.
+
+pub const backoff_base_us: u64 = 50;
+pub const default_retry_attempts: u32 = 20;
+pub const default_retry_timeout_us: u64 = 2000;
+/// Longest request line: "-R" ++ u32 ++ "W" ++ u64.
+pub const retry_request_max = 2 + 10 + 1 + 20;
+
+/// Position in a retry sequence: the attempt about to be sent (1-based), the
+/// backoff already waited, and the next backoff delay.
+pub const Retry = struct { attempt: u32 = 1, waited_us: u64 = 0, delay_us: u64 = backoff_base_us };
+
+pub const RetryStep = union(enum) {
+	sleep: struct { us: u64, next: Retry },
+	give_up_attempts,
+	give_up_timeout,
+};
+
+/// Protocol line for one attempt: "" or "-" (hyphenated) first; retries append
+/// "R<attempt>W<waited_us>" so the daemon can log and count them.
+pub fn retryRequest(r: Retry, hyphens: bool, out: []u8) []u8 {
+	const tok: []const u8 = if (hyphens) "-" else "";
+	if (r.attempt <= 1) return std.fmt.bufPrint(out, "{s}", .{tok}) catch unreachable;
+	return std.fmt.bufPrint(out, "{s}R{d}W{d}", .{ tok, r.attempt, r.waited_us }) catch unreachable;
+}
+
+/// A daemon served the request when its reply is non-empty and not an ERR line.
+pub fn replyServed(resp: []const u8) bool {
+	return resp.len > 0 and !std.mem.startsWith(u8, resp, "ERR");
+}
+
+/// Next move after a refused attempt: give up at the attempt cap, then when the
+/// next sleep would exceed the total wait budget; otherwise sleep and grow the
+/// delay by floor(delay * (1.5 + jitter * 0.1)) with `jitter` in [0, 1).
+pub fn retryAfterRefusal(r: Retry, max_attempts: u32, timeout_us: u64, jitter: f64) RetryStep {
+	if (r.attempt >= max_attempts) return .give_up_attempts;
+	if (r.waited_us +| r.delay_us > timeout_us) return .give_up_timeout;
+	const grown = @floor(@as(f64, @floatFromInt(r.delay_us)) * (1.5 + jitter * 0.1));
+	const max_f: f64 = @floatFromInt(std.math.maxInt(u64));
+	const next_delay: u64 = if (grown >= max_f) std.math.maxInt(u64) else @intFromFloat(grown);
+	return .{ .sleep = .{ .us = r.delay_us, .next = .{
+		.attempt = r.attempt + 1,
+		.waited_us = r.waited_us + r.delay_us,
+		.delay_us = next_delay,
+	} } };
+}
+
+/// Attempt cap from UUIDV7_DAEMON_NO_RETRY ("1"/"true" in any case forces one
+/// try) and UUIDV7_DAEMON_RETRIES (a decimal integer >= 1, saturating).
+/// Anything else gives the default. The Lua oracle's tonumber also accepts hex,
+/// exponents and fractions; this port takes plain decimal only.
+pub fn retryAttempts(no_retry: ?[]const u8, retries: ?[]const u8) u32 {
+	if (no_retry) |v| if (std.ascii.eqlIgnoreCase(v, "1") or std.ascii.eqlIgnoreCase(v, "true")) return 1;
+	const n = parseDecimalSaturating(retries orelse return default_retry_attempts) orelse return default_retry_attempts;
+	if (n < 1) return default_retry_attempts;
+	return std.math.cast(u32, n) orelse std.math.maxInt(u32);
+}
+
+/// Total backoff budget from UUIDV7_DAEMON_RETRY_TIMEOUT_US (decimal >= 0, saturating).
+pub fn retryTimeoutUs(text: ?[]const u8) u64 {
+	return parseDecimalSaturating(text orelse return default_retry_timeout_us) orelse default_retry_timeout_us;
+}
+
+fn parseDecimalSaturating(text: []const u8) ?u64 {
+	if (!isDecimal(text)) return null;
+	return std.fmt.parseInt(u64, text, 10) catch std.math.maxInt(u64);
+}

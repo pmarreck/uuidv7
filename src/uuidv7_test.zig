@@ -144,3 +144,73 @@ test "generated sequence sorts in generation order (sorted sweep)" {
 		prev = cur;
 	}
 }
+
+// ---- daemon client retry policy (oracle: lib/uuidv7_client.lua try_daemon) ----
+
+fn requestLine(r: core.Retry, hyphens: bool) []const u8 {
+	const S = struct { var buf: [core.retry_request_max]u8 = undefined; };
+	return core.retryRequest(r, hyphens, &S.buf);
+}
+
+test "retry request: first attempt is the bare token, retries carry R<attempt>W<waited>" {
+	try testing.expectEqualStrings("", requestLine(.{}, false));
+	try testing.expectEqualStrings("-", requestLine(.{}, true));
+	try testing.expectEqualStrings("R2W50", requestLine(.{ .attempt = 2, .waited_us = 50, .delay_us = 75 }, false));
+	try testing.expectEqualStrings("-R3W125", requestLine(.{ .attempt = 3, .waited_us = 125, .delay_us = 112 }, true));
+	const big = requestLine(.{ .attempt = std.math.maxInt(u32), .waited_us = std.math.maxInt(u64), .delay_us = 1 }, true);
+	try testing.expectEqualStrings("-R4294967295W18446744073709551615", big);
+}
+
+test "reply served: any non-empty reply that does not start with ERR" {
+	const served = [_][]const u8{ "017f22e279b077ffbfc90c9a45e78a47\n", "x", "OK\n", "er", "EERR" };
+	const refused = [_][]const u8{ "", "ERR", "ERR overloaded\n", "ERRx" };
+	for (served) |s| try testing.expect(core.replyServed(s));
+	for (refused) |s| try testing.expect(!core.replyServed(s));
+}
+
+test "retry step: sleeps the delay, then grows it ~1.5x plus jitter (floored)" {
+	const d = core.retryAfterRefusal(.{}, 20, 2000, 0.0);
+	try testing.expectEqual(core.RetryStep{ .sleep = .{ .us = 50, .next = .{ .attempt = 2, .waited_us = 50, .delay_us = 75 } } }, d);
+	const j = core.retryAfterRefusal(.{ .attempt = 2, .waited_us = 50, .delay_us = 75 }, 20, 2000, 0.999);
+	// floor(75 * (1.5 + 0.0999)) = floor(119.9925) = 119
+	try testing.expectEqual(core.RetryStep{ .sleep = .{ .us = 75, .next = .{ .attempt = 3, .waited_us = 125, .delay_us = 119 } } }, j);
+}
+
+test "retry step: the attempt cap is checked before the timeout" {
+	try testing.expectEqual(core.RetryStep.give_up_attempts, core.retryAfterRefusal(.{ .attempt = 3, .waited_us = 0, .delay_us = 50 }, 3, 0, 0.0));
+	try testing.expectEqual(core.RetryStep.give_up_attempts, core.retryAfterRefusal(.{}, 1, 2000, 0.0));
+	try testing.expectEqual(core.RetryStep.give_up_timeout, core.retryAfterRefusal(.{ .attempt = 2, .waited_us = 1990, .delay_us = 11 }, 20, 2000, 0.0));
+	// waited + delay == timeout is still allowed
+	const edge = core.retryAfterRefusal(.{ .attempt = 2, .waited_us = 1990, .delay_us = 10 }, 20, 2000, 0.0);
+	try testing.expect(edge == .sleep);
+}
+
+test "retry step: default policy gives up on the timeout well before 20 attempts" {
+	var r: core.Retry = .{};
+	var total: u64 = 0;
+	while (true) {
+		switch (core.retryAfterRefusal(r, core.default_retry_attempts, core.default_retry_timeout_us, 0.0)) {
+			.sleep => |s| { total += s.us; r = s.next; },
+			.give_up_attempts => return error.UnexpectedAttemptCap,
+			.give_up_timeout => break,
+		}
+	}
+	try testing.expect(total <= core.default_retry_timeout_us);
+	try testing.expect(r.attempt < core.default_retry_attempts);
+}
+
+test "retry config from environment text: decimal integers only, else defaults" {
+	try testing.expectEqual(@as(u32, 20), core.retryAttempts(null, null));
+	try testing.expectEqual(@as(u32, 5), core.retryAttempts(null, "5"));
+	try testing.expectEqual(@as(u32, 20), core.retryAttempts(null, "0"));
+	try testing.expectEqual(@as(u32, 20), core.retryAttempts(null, "abc"));
+	try testing.expectEqual(@as(u32, 20), core.retryAttempts(null, ""));
+	try testing.expectEqual(@as(u32, std.math.maxInt(u32)), core.retryAttempts(null, "99999999999999999999999"));
+	for ([_][]const u8{ "1", "true", "TRUE", "True" }) |v| try testing.expectEqual(@as(u32, 1), core.retryAttempts(v, "5"));
+	for ([_][]const u8{ "0", "yes", "", "false" }) |v| try testing.expectEqual(@as(u32, 5), core.retryAttempts(v, "5"));
+	try testing.expectEqual(@as(u64, 2000), core.retryTimeoutUs(null));
+	try testing.expectEqual(@as(u64, 0), core.retryTimeoutUs("0"));
+	try testing.expectEqual(@as(u64, 750), core.retryTimeoutUs("750"));
+	try testing.expectEqual(@as(u64, 2000), core.retryTimeoutUs("-5"));
+	try testing.expectEqual(@as(u64, std.math.maxInt(u64)), core.retryTimeoutUs("99999999999999999999999"));
+}

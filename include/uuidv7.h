@@ -85,6 +85,50 @@ int uuidv7_state_encode(const uuidv7_state *state, char *out, size_t out_cap, si
 /* Strict inverse of uuidv7_state_encode: UUIDV7_ERR_INVALID for any other text. */
 int uuidv7_state_decode(const char *text, size_t text_len, uuidv7_state *out);
 
+/*
+ * Daemon client retry policy. A reachable daemon owns the live stream, so a
+ * client whose request gets an empty or ERR reply retries the daemon with
+ * bounded, growing backoff and never generates locally. The caller performs the
+ * socket I/O, the sleeping and the jitter draw.
+ */
+#define UUIDV7_RETRY_REQUEST_MAX        33  /* "-R<uint32>W<uint64>" */
+#define UUIDV7_RETRY_SLEEP               0  /* sleep *sleep_us, then send *next */
+#define UUIDV7_RETRY_GIVE_UP_ATTEMPTS    1  /* the attempt cap is reached */
+#define UUIDV7_RETRY_GIVE_UP_TIMEOUT     2  /* the next sleep would exceed the wait budget */
+
+typedef struct uuidv7_retry {
+	uint32_t attempt;    /* attempt about to be sent, from 1 */
+	uint64_t waited_us;  /* backoff already waited */
+	uint64_t delay_us;   /* next backoff delay */
+} uuidv7_retry;
+
+/* First attempt: attempt 1, nothing waited, 50 us initial delay. */
+void uuidv7_retry_init(uuidv7_retry *r);
+
+/* Request line for this attempt, without the newline: "" or "-" (hyphens) on
+ * the first attempt, then "R<attempt>W<waited_us>" appended on retries. */
+int uuidv7_retry_request(const uuidv7_retry *r, int hyphens, char *out, size_t out_cap, size_t *out_len);
+
+/* 1 when the daemon served the request (a non-empty reply not starting with
+ * "ERR"), else 0. */
+int uuidv7_reply_served(const char *reply, size_t reply_len);
+
+/* After a refused attempt: *action is one of UUIDV7_RETRY_*. On SLEEP, *sleep_us
+ * and *next are set; the delay then grows by floor(delay * (1.5 + jitter / 10)).
+ * jitter must be in [0, 1), else UUIDV7_ERR_RANGE. */
+int uuidv7_retry_after_refusal(const uuidv7_retry *r, uint32_t max_attempts, uint64_t timeout_us,
+	double jitter, uuidv7_retry *next, uint8_t *action, uint64_t *sleep_us);
+
+/* Attempt cap from the texts of UUIDV7_DAEMON_NO_RETRY ("1" or "true", any
+ * case: one try) and UUIDV7_DAEMON_RETRIES (decimal >= 1, saturating); else 20.
+ * Pass an unset variable as NULL, 0. */
+int uuidv7_retry_attempts(const char *no_retry, size_t no_retry_len,
+	const char *retries, size_t retries_len, uint32_t *out);
+
+/* Wait budget from the text of UUIDV7_DAEMON_RETRY_TIMEOUT_US (decimal,
+ * saturating); else 2000. */
+int uuidv7_retry_timeout_us(const char *text, size_t text_len, uint64_t *out);
+
 #ifdef __cplusplus
 }
 #endif
