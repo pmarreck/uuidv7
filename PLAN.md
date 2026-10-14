@@ -10,8 +10,12 @@ Open work in priority order. Completed items: [docs/PLAN_LOG.md](docs/PLAN_LOG.m
 	- [x] uuidv7z routes live generation to a running uuidv7 daemon (C client over AF_UNIX / Winsock; retry policy in the Zig core, 968a3e0) (done 2026-10-14 18:13 EDT)
 - [x] Reproducible Windows test toolchain: flake output luajit-windows-x86_64 + import check, and ./test-windows runner (done 2026-10-14 14:32 EDT)
 - [ ] Counter/daemon scope audit (Turing request 2026-10-14): state file and socket are found via TMPDIR/XDG_RUNTIME_DIR, so sharing is per matching environment; add deterministic regressions for differing TMPDIR, daemon/standalone transitions and unsafe shared /tmp, then fix within per-user scope (context: docs/plan_context/counter_scope.md)
+	- [x] Measure the boundaries: differing TMPDIR 20/40 out of order, nix develop sets a per-shell TMPDIR, unusable file falls back silently, socket uses a different lookup (done 2026-10-14 19:25 EDT)
+	- [x] Fix: state file written through a planted symlink (O_NOFOLLOW in both CLIs, tests/uuidv7_state_safety_test) (done 2026-10-14 19:21 EDT, 7746c5a)
+	- [ ] Per-user, environment-independent state and socket location, daemon seeding/write-back, daemon owner check: waits on decision uuidv7-counter-scope
 
 ## Awaiting BDFN decisions (queued in the walking brief)
+- [ ] Decision uuidv7-counter-scope revision 1 (queued 2026-10-14): per-user home-directory state (recommended), per-user runtime directory, a system service, or defer
 - [ ] Decision uuidv7-os-rng-failure-policy revision 2 (queued 2026-10-14): fail closed or keep the warn + clock-seeded fallback when the OS RNG fails
 
 ## Investigate
@@ -25,8 +29,6 @@ Open work in priority order. Completed items: [docs/PLAN_LOG.md](docs/PLAN_LOG.m
 - [ ] If uuidv7z gains batch output or a many-UUIDs-per-process library API: seed randomz's BLAKE3 DRBG once from OS entropy instead of a syscall per new tick (sibling-Zig import; mind fork duplication)
 
 ## Done (recent)
-- [x] Zig port: pure core, pointer+length C ABI, C CLI, ./build, ./build-all for 5 triples + wasm32 (done 2026-10-06 18:06 EDT, 2bbd864)
-- [x] LuaJIT-oracle differential suites (C ABI and CLI), 8 mutants caught (done 2026-10-06 18:06 EDT, 2bbd864)
 - [x] Mechatron Prime CI targets manifest + badge; README platform table (done 2026-10-06 18:10 EDT, 39bb636)
 - [x] wasm32-freestanding core compiles with all exports; ReleaseSmall 7,047 bytes (done 2026-10-06 18:10 EDT)
 - [x] BDFN chose to fix the inherited CLI argument quirks (done 2026-10-06 23:08 EDT)

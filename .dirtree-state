@@ -9,6 +9,7 @@ annotate=[
 	build.zig = Zig build graph: static/shared C ABI lib, uuidv7z CLI, unit tests, wasm32 core
 	c/uuidv7z.c = C CLI: all I/O (clock, OS RNG, locked state file) via the C ABI only
 	docs/PLAN_LOG.md = append-only log of completed PLAN.md items
+	docs/plan_context/counter_scope.md = Audit of counter/daemon scope: lookup rules, measured boundaries, proposed per-user fix
 	include/uuidv7.h = public C ABI header
 	intents/three_os_and_zig_port.md = accepted direction: 3 OSes + Zig port with LuaJIT oracle, done criteria
 	lib/uuidv7_net.lua = platform layer: sockets, poll, signals, restart handoff, sleep (POSIX or Winsock AF_UNIX)
