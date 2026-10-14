@@ -1,52 +1,17 @@
--- uuidv7 daemon: a single-threaded, poll(2)-based Unix-domain-socket server that
--- dispenses UUIDv7 values. Single process => the live counter is in-memory and the
+-- uuidv7 daemon: a single-threaded, poll-based Unix-domain-socket server that
+-- dispenses UUIDv7 values (POSIX poll(2), or Winsock AF_UNIX + WSAPoll on Windows;
+-- see uuidv7_net). Single process => the live counter is in-memory and the
 -- cross-process monotonicity problem disappears. Zero deps (LuaJIT + FFI).
 
 local core = require("uuidv7_core")
 local json = require("uuidv7_json")
+local net = require("uuidv7_net")
 local ffi = require("ffi")
 local bit = require("bit")
 
 local is_macos = jit.os == "OSX"
+local is_windows = net.is_windows
 
--- Only NEW symbols (core already cdef'd the generic libc/time/random ones).
-ffi.cdef[[
-	typedef unsigned int socklen_t;
-	typedef unsigned int uid_t;
-	typedef unsigned int gid_t;
-	int socket(int domain, int type, int protocol);
-	int bind(int sockfd, const void *addr, socklen_t addrlen);
-	int listen(int sockfd, int backlog);
-	int accept(int sockfd, void *addr, socklen_t *addrlen);
-	ssize_t recv(int sockfd, void *buf, size_t len, int flags);
-	ssize_t send(int sockfd, const void *buf, size_t len, int flags);
-	int fcntl(int fd, int cmd, ...);
-	struct pollfd { int fd; short events; short revents; };
-	int poll(struct pollfd *fds, unsigned long nfds, int timeout);
-	typedef void (*uuidv7_sighandler_t)(int);
-	uuidv7_sighandler_t signal(int signum, uuidv7_sighandler_t handler);
-	int execv(const char *path, char *const argv[]);
-	int setenv(const char *name, const char *value, int overwrite);
-	int getpid(void);
-	int chmod(const char *path, mode_t mode);
-	int getpeereid(int sockfd, uid_t *euid, gid_t *egid);
-	int getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *optlen);
-	struct ucred { int pid; unsigned int uid; unsigned int gid; };
-]]
-if is_macos then
-	ffi.cdef[[ struct sockaddr_un { unsigned char sun_len; unsigned char sun_family; char sun_path[104]; }; ]]
-else
-	ffi.cdef[[ struct sockaddr_un { unsigned short sun_family; char sun_path[108]; }; ]]
-end
-
-local C = ffi.C
-
-local AF_UNIX, SOCK_STREAM = 1, 1
-local O_NONBLOCK = is_macos and 0x0004 or 0x800
-local F_GETFL, F_SETFL, F_SETFD = 3, 4, 2
-local POLLIN, POLLERR, POLLHUP = 1, 8, 0x10
-local SIGINT, SIGTERM, SIGPIPE = 2, 15, 13
-local SIG_IGN = ffi.cast("uuidv7_sighandler_t", 1)
 local MAX_LINE = 64
 
 local M = {}
@@ -57,7 +22,8 @@ local function strip_slash(p) return (p:gsub("/+$", "")) end
 
 local function socket_path()
 	if os.getenv("UUIDV7_SOCK") then return os.getenv("UUIDV7_SOCK") end
-	local base = os.getenv("XDG_RUNTIME_DIR") or os.getenv("TMPDIR") or "/tmp"
+	local base = os.getenv("XDG_RUNTIME_DIR") or os.getenv("TMPDIR")
+		or (is_windows and (os.getenv("TEMP") or os.getenv("TMP"))) or "/tmp"
 	return strip_slash(base) .. "/uuidv7.sock"
 end
 
@@ -65,14 +31,17 @@ local function log_path()
 	if os.getenv("UUIDV7_LOG") then return os.getenv("UUIDV7_LOG") end
 	local xdg = os.getenv("XDG_STATE_HOME")
 	if xdg then return strip_slash(xdg) .. "/uuidv7/uuidv7.log" end
+	if is_windows and os.getenv("LOCALAPPDATA") then
+		return strip_slash(os.getenv("LOCALAPPDATA")) .. "/uuidv7/uuidv7.log"
+	end
 	local home = os.getenv("HOME") or "."
 	if is_macos then return home .. "/Library/Logs/uuidv7.log" end
 	return home .. "/.local/state/uuidv7/uuidv7.log"
 end
 
 local function ensure_dir(path)
-	local dir = path:match("^(.*)/[^/]+$")
-	if dir and dir ~= "" then os.execute("mkdir -p '" .. dir:gsub("'", "'\\''") .. "' 2>/dev/null") end
+	local dir = path:match("^(.*)[/\\][^/\\]+$")
+	if dir and dir ~= "" then net.ensure_dir(dir) end
 end
 
 -- ===== time / logging =====
@@ -99,7 +68,7 @@ local function stats_table()
 	local up_ns = core.get_nanotime() - server.start_ns
 	return {
 		version = core.VERSION,
-		pid = tonumber(C.getpid()),
+		pid = net.getpid(),
 		socket = server.sock_path,
 		started = server.start_iso,
 		now = iso,
@@ -227,25 +196,11 @@ local function do_generate(req)
 	return table.concat(lines, "\n") .. "\n"
 end
 
--- ===== fd / socket helpers =====
-local function set_nonblock(fd)
-	local fl = tonumber(C.fcntl(fd, F_GETFL, ffi.new("int", 0)))
-	C.fcntl(fd, F_SETFL, ffi.new("int", bit.bor(fl, O_NONBLOCK)))
-end
-
--- Force a fd blocking. macOS/BSD accept() inherits O_NONBLOCK from the listener
--- (Linux does not), so accepted conns must be made blocking explicitly or large
--- send()s get truncated at the socket buffer with EAGAIN.
-local function set_block(fd)
-	local fl = tonumber(C.fcntl(fd, F_GETFL, ffi.new("int", 0)))
-	C.fcntl(fd, F_SETFL, ffi.new("int", bit.band(fl, bit.bnot(O_NONBLOCK))))
-end
-
 local function send_all(fd, s)
 	local p = ffi.cast("const char*", s)
 	local total, sent = #s, 0
 	while sent < total do
-		local nrec = tonumber(C.send(fd, p + sent, total - sent, 0))
+		local nrec = net.send(fd, p + sent, total - sent)
 		if nrec <= 0 then return false end
 		sent = sent + nrec
 	end
@@ -253,30 +208,13 @@ local function send_all(fd, s)
 end
 local function send_line(fd, s) return send_all(fd, s .. "\n") end
 
--- Peer UID for logging. MUST never throw: getpeereid exists on macOS/BSD but is an
--- UNDEFINED symbol in nix's Linux glibc for ffi.C, so even touching C.getpeereid raises.
--- macOS -> getpeereid; Linux -> SO_PEERCRED; any failure -> nil.
-local function peer_uid(fd)
-	local ok, uid = pcall(function()
-		if is_macos then
-			local euid = ffi.new("uid_t[1]")
-			local egid = ffi.new("gid_t[1]")
-			if C.getpeereid(fd, euid, egid) == 0 then return tonumber(euid[0]) end
-		else
-			local cred = ffi.new("struct ucred")
-			local len = ffi.new("socklen_t[1]", ffi.sizeof("struct ucred"))
-			if C.getsockopt(fd, 1, 17, cred, len) == 0 then return tonumber(cred.uid) end -- SOL_SOCKET, SO_PEERCRED
-		end
-		return nil
-	end)
-	return ok and uid or nil
-end
+local peer_uid = net.peer_uid
 
 -- ===== lifecycle =====
 local function resolve_exe(a0)
 	if not a0 or a0 == "" then return "uuidv7" end
-	if a0:sub(1, 1) == "/" then return a0 end
-	if a0:find("/") then return (os.getenv("PWD") or ".") .. "/" .. a0 end
+	if a0:sub(1, 1) == "/" or a0:match("^%a:[/\\]") then return a0 end
+	if a0:find("[/\\]") then return (os.getenv("PWD") or ".") .. "/" .. a0 end
 	for dir in (os.getenv("PATH") or ""):gmatch("[^:]+") do
 		local p = dir .. "/" .. a0
 		local f = io.open(p, "r")
@@ -293,28 +231,24 @@ local function shutdown(reason)
 	local s = stats_table(); s.reason = reason
 	log_event("shutdown", s)
 	close_log()
-	C.unlink(server.sock_path)
+	os.remove(server.sock_path)
 	os.exit(0)
 end
 
 local function restart()
 	log_event("restart", stats_table())
 	close_log()
-	C.fcntl(server.listen_fd, F_SETFD, ffi.new("int", 0))   -- clear CLOEXEC so the fd survives exec
-	C.setenv("UUIDV7_LISTEN_FD", tostring(server.listen_fd), 1)
-	local argv = ffi.new("char*[3]")
-	local exe = ffi.new("char[?]", #server.exe + 1); ffi.copy(exe, server.exe)
-	local flag = ffi.new("char[?]", 9); ffi.copy(flag, "--daemon")
-	argv[0] = exe; argv[1] = flag; argv[2] = nil
-	C.execv(server.exe, argv)
-	io.stderr:write("uuidv7 daemon: re-exec failed\n")
+	-- POSIX re-execs in place; Windows starts a successor that inherits the listener.
+	-- Either way the listener never closes, so clients see no gap.
+	if net.handoff(server.listen_fd, server.exe) and is_windows then os.exit(0) end
+	io.stderr:write("uuidv7 daemon: restart failed\n")
 	os.exit(1)
 end
 
 -- ===== per-connection processing =====
 local conns = {}
 local function close_conn(fd)
-	if conns[fd] then conns[fd] = nil; C.close(fd); server.conns_open = server.conns_open - 1 end
+	if conns[fd] then conns[fd] = nil; net.close(fd); server.conns_open = server.conns_open - 1 end
 end
 
 local function dispatch(fd, line)
@@ -398,25 +332,12 @@ end
 -- ===== bind / adopt =====
 local function make_listener()
 	local adopted = os.getenv("UUIDV7_LISTEN_FD")
-	if adopted then
-		local fd = tonumber(adopted)
-		set_nonblock(fd)
-		return fd, true
-	end
+	if adopted then return net.adopt(tonumber(adopted)), true end
 	local path = server.sock_path
-	assert(#path < 100, "socket path too long: " .. path)
+	assert(#path <= net.MAX_PATH, "socket path too long: " .. path)
 	ensure_dir(path)
-	C.unlink(path)
-	local fd = C.socket(AF_UNIX, SOCK_STREAM, 0)
-	assert(fd >= 0, "socket() failed")
-	local addr = ffi.new("struct sockaddr_un")
-	addr.sun_family = AF_UNIX
-	if is_macos then addr.sun_len = ffi.sizeof("struct sockaddr_un") end
-	ffi.copy(addr.sun_path, path, #path)
-	assert(C.bind(fd, addr, ffi.sizeof("struct sockaddr_un")) == 0, "bind() failed on " .. path)
-	C.chmod(path, 384)   -- 0600
-	assert(C.listen(fd, 64) == 0, "listen() failed")
-	set_nonblock(fd)
+	local fd, err = net.listen(path)
+	assert(fd, err)
 	return fd, false
 end
 
@@ -444,7 +365,7 @@ function M.run(opts)
 	local listen_fd, adopted = make_listener()
 	server.listen_fd = listen_fd
 	log_event(adopted and "restart-ready" or "start",
-		{ pid = tonumber(C.getpid()), version = core.VERSION, socket = server.sock_path, adopted = adopted })
+		{ pid = net.getpid(), version = core.VERSION, socket = server.sock_path, adopted = adopted })
 
 	-- Readiness line: emitted to stdout the moment we're listening. Lets supervisors
 	-- (and the test harness) synchronize on "ready" instead of sleeping/polling.
@@ -454,54 +375,37 @@ function M.run(opts)
 
 	-- signals: ignore SIGPIPE; SIGINT/SIGTERM set a stop flag checked by the loop
 	local stop = ffi.new("int[1]", 0)
-	local function on_signal() stop[0] = 1 end
-	jit.off(on_signal)
-	local cb = ffi.cast("uuidv7_sighandler_t", on_signal)
-	C.signal(SIGINT, cb); C.signal(SIGTERM, cb); C.signal(SIGPIPE, SIG_IGN)
+	net.install_stop_signals(stop)
 
 	while stop[0] == 0 do
 		local fds = { listen_fd }
 		for fd in pairs(conns) do fds[#fds + 1] = fd end
-		local nf = #fds
-		local pa = ffi.new("struct pollfd[?]", nf)
-		for i = 1, nf do pa[i - 1].fd = fds[i]; pa[i - 1].events = POLLIN; pa[i - 1].revents = 0 end
-		local r = tonumber(C.poll(pa, nf, 1000))
+		local ready = net.poll(fds, 1000)
 		if stop[0] ~= 0 then break end
-		if r and r > 0 then
-			for i = 0, nf - 1 do
-				local re = pa[i].revents
-				if re ~= 0 then
-					local fd = pa[i].fd
-					if fd == listen_fd then
-						while true do
-							local cfd = tonumber(C.accept(listen_fd, nil, nil))
-							if cfd < 0 then break end
-							-- accepted conns stay blocking; poll(POLLIN) gates recv, send is small.
-							-- FD_CLOEXEC so client conns do NOT survive a re-exec (only the
-							-- listener should) -- otherwise restart leaks them and clients hang.
-							C.fcntl(cfd, F_SETFD, ffi.new("int", 1))
-							set_block(cfd)   -- macOS inherits the listener's O_NONBLOCK; undo it
-							conns[cfd] = { buf = "", hs = "start" }
-							server.conns_open = server.conns_open + 1
-							server.conns_served = server.conns_served + 1
-						end
-					elseif bit.band(re, bit.bor(POLLIN, POLLHUP)) ~= 0 then
-						-- read FIRST even if POLLHUP is set: a client that shut its write
-						-- side (oneshot) delivers POLLIN+POLLHUP together; the request is
-						-- still pending. Only close once recv actually drains to EOF.
-						local rb = ffi.new("char[?]", 4096)
-						local nr = tonumber(C.recv(fd, rb, 4096, 0))
-						if nr <= 0 then
-							close_conn(fd)
-						else
-							local conn = conns[fd]
-							conn.buf = conn.buf .. ffi.string(rb, nr)
-							if process(conn, fd) == false then close_conn(fd) end
-						end
-					elseif bit.band(re, POLLERR) ~= 0 then
-						close_conn(fd)
-					end
+		for fd, re in pairs(ready) do
+			if fd == listen_fd then
+				while true do
+					local cfd = net.accept(listen_fd)
+					if not cfd then break end
+					conns[cfd] = { buf = "", hs = "start" }
+					server.conns_open = server.conns_open + 1
+					server.conns_served = server.conns_served + 1
 				end
+			elseif conns[fd] and bit.band(re, bit.bor(net.READ, net.HUP)) ~= 0 then
+				-- read FIRST even if HUP is set: a client that shut its write side
+				-- (oneshot) delivers READ+HUP together; the request is still pending.
+				-- Only close once recv actually drains to EOF.
+				local rb = ffi.new("char[?]", 4096)
+				local nr = net.recv(fd, rb, 4096)
+				if nr <= 0 then
+					close_conn(fd)
+				else
+					local conn = conns[fd]
+					conn.buf = conn.buf .. ffi.string(rb, nr)
+					if process(conn, fd) == false then close_conn(fd) end
+				end
+			elseif conns[fd] and bit.band(re, net.ERR) ~= 0 then
+				close_conn(fd)
 			end
 		end
 	end

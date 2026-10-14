@@ -1,35 +1,16 @@
 -- uuidv7 UDS client: used by the CLI to transparently use a running daemon, and by
--- the test harness to drive it. Never loaded in the same process as the daemon, so
--- its socket cdefs don't collide with the daemon's.
+-- the test harness to drive it. All socket and sleep calls go through uuidv7_net.
 
 local ffi = require("ffi")
-local core = require("uuidv7_core")   -- ensures close()/ssize_t/size_t are declared; clock for jitter seed
-
-local is_macos = jit.os == "OSX"
-
-ffi.cdef[[
-	typedef unsigned int socklen_t;
-	int socket(int domain, int type, int protocol);
-	int connect(int sockfd, const void *addr, socklen_t addrlen);
-	ssize_t send(int sockfd, const void *buf, size_t len, int flags);
-	ssize_t recv(int sockfd, void *buf, size_t len, int flags);
-	int shutdown(int sockfd, int how);
-	int nanosleep(const struct timespec *req, struct timespec *rem);
-]]
-if is_macos then
-	ffi.cdef[[ struct uuidv7_caddr { unsigned char sun_len; unsigned char sun_family; char sun_path[104]; }; ]]
-else
-	ffi.cdef[[ struct uuidv7_caddr { unsigned short sun_family; char sun_path[108]; }; ]]
-end
-
-local C = ffi.C
-local AF_UNIX, SOCK_STREAM, SHUT_WR = 1, 1, 1
+local core = require("uuidv7_core")   -- clock for jitter seed
+local net = require("uuidv7_net")     -- sockets + sleep, POSIX or Winsock
 
 local M = {}
 
 local function default_path()
 	if os.getenv("UUIDV7_SOCK") then return os.getenv("UUIDV7_SOCK") end
-	local base = os.getenv("XDG_RUNTIME_DIR") or os.getenv("TMPDIR") or "/tmp"
+	local base = os.getenv("XDG_RUNTIME_DIR") or os.getenv("TMPDIR")
+		or (net.is_windows and (os.getenv("TEMP") or os.getenv("TMP"))) or "/tmp"
 	return (base:gsub("/+$", "")) .. "/uuidv7.sock"
 end
 M.default_path = default_path
@@ -39,17 +20,9 @@ Conn.__index = Conn
 
 function M.open(path)
 	path = path or default_path()
-	if #path >= 100 then return nil, "socket path too long" end
-	local fd = C.socket(AF_UNIX, SOCK_STREAM, 0)
-	if fd < 0 then return nil, "socket() failed" end
-	local addr = ffi.new("struct uuidv7_caddr")
-	addr.sun_family = AF_UNIX
-	if is_macos then addr.sun_len = ffi.sizeof("struct uuidv7_caddr") end
-	ffi.copy(addr.sun_path, path, #path)
-	if C.connect(fd, addr, ffi.sizeof("struct uuidv7_caddr")) ~= 0 then
-		C.close(fd)
-		return nil, "connect refused"
-	end
+	if #path > net.MAX_PATH then return nil, "socket path too long" end
+	local fd, err = net.connect(path)
+	if not fd then return nil, err end
 	return setmetatable({ fd = fd, buf = "" }, Conn)
 end
 
@@ -57,7 +30,7 @@ function Conn:send_raw(s)
 	local p = ffi.cast("const char*", s)
 	local total, sent = #s, 0
 	while sent < total do
-		local n = tonumber(C.send(self.fd, p + sent, total - sent, 0))
+		local n = net.send(self.fd, p + sent, total - sent)
 		if n <= 0 then return false end
 		sent = sent + n
 	end
@@ -68,7 +41,7 @@ function Conn:send(line) return self:send_raw(line .. "\n") end
 
 local function fill(self)
 	local rb = ffi.new("char[?]", 4096)
-	local n = tonumber(C.recv(self.fd, rb, 4096, 0))
+	local n = net.recv(self.fd, rb, 4096)
 	if n <= 0 then return false end
 	self.buf = self.buf .. ffi.string(rb, n)
 	return true
@@ -96,7 +69,7 @@ function Conn:recv_bytes(n)
 	return out
 end
 
-function Conn:shutdown_wr() C.shutdown(self.fd, SHUT_WR) end
+function Conn:shutdown_wr() net.shutdown_write(self.fd) end
 
 function Conn:recv_all()
 	while fill(self) do end
@@ -105,7 +78,7 @@ function Conn:recv_all()
 	return out
 end
 
-function Conn:close() if self.fd then C.close(self.fd); self.fd = nil end end
+function Conn:close() if self.fd then net.close(self.fd); self.fd = nil end end
 
 -- One request, full response (client signals EOF so the server returns and closes).
 function M.oneshot(path, line)
@@ -145,14 +118,8 @@ function M.retry_timeout_us()
 	return (n and n >= 0) and math.floor(n) or DEFAULT_TIMEOUT_US
 end
 
--- Sleep for `us` microseconds (sub-millisecond capable via nanosleep).
-function M.sleep_us(us)
-	if not us or us <= 0 then return end
-	local ts = ffi.new("struct timespec")
-	ts.tv_sec = math.floor(us / 1000000)
-	ts.tv_nsec = math.floor((us % 1000000) * 1000)
-	C.nanosleep(ts, nil)
-end
+-- Sleep for `us` microseconds (sub-millisecond capable).
+M.sleep_us = net.sleep_us
 
 local function unserved_msg(cause, attempt, waited_us, timeout_us, last)
 	local why = (last and last ~= "") and (" (last reply: " .. (last:gsub("%s+$", "")) .. ")") or ""

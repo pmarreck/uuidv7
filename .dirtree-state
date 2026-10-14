@@ -11,6 +11,7 @@ annotate=[
 	docs/PLAN_LOG.md = append-only log of completed PLAN.md items
 	include/uuidv7.h = public C ABI header
 	intents/three_os_and_zig_port.md = accepted direction: 3 OSes + Zig port with LuaJIT oracle, done criteria
+	lib/uuidv7_net.lua = platform layer: sockets, poll, signals, restart handoff, sleep (POSIX or Winsock AF_UNIX)
 	src/ffi.zig = C ABI exports (pointer+length) over the pure core
 	src/uuidv7.zig = pure Zig core: advance (monotonic counter), encode, format, extract, parseTimestamp, state codec
 	src/uuidv7_test.zig = Zig core unit tests incl. sorted sweep
