@@ -8,6 +8,7 @@ annotate=[
 	build-all = cross-compile 5 targets + wasm32 and verify file headers
 	build.zig = Zig build graph: static/shared C ABI lib, uuidv7z CLI, unit tests, wasm32 core
 	c/uuidv7z.c = C CLI: all I/O (clock, OS RNG, locked state file) via the C ABI only
+	docs/PLAN_LOG.md = append-only log of completed PLAN.md items
 	include/uuidv7.h = public C ABI header
 	intents/three_os_and_zig_port.md = accepted direction: 3 OSes + Zig port with LuaJIT oracle, done criteria
 	src/ffi.zig = C ABI exports (pointer+length) over the pure core
