@@ -25,14 +25,14 @@ for entry in "${clis[@]}"; do
 	name="${entry%%:*}" cmd="${entry#*:}"
 	d="$TMPDIR/$name"; mkdir -p "$d/state" "$d/elsewhere"
 	printf 'precious data\n' > "$d/elsewhere/victim"
-	ln -s "$d/elsewhere/victim" "$d/state/uuidv7-sequence"
-	out="$(TMPDIR="$d/state" $cmd 2>/dev/null)"; rc=$?
+	ln -s "$d/elsewhere/victim" "$d/state/sequence"
+	out="$(UUIDV7_STATE_DIR="$d/state" $cmd 2>/dev/null)"; rc=$?
 	check "$name: a symlinked state file's target is not overwritten" '[ "$(cat "$d/elsewhere/victim")" = "precious data" ]'
 	check "$name: generation still succeeds" '[ "$rc" -eq 0 ] && [[ "$out" =~ ^[0-9a-f]{32}$ ]]'
 
-	mv "$d/state/uuidv7-sequence" "$d/old-link"
-	ln -s "$d/elsewhere/created" "$d/state/uuidv7-sequence"
-	TMPDIR="$d/state" $cmd >/dev/null 2>&1
+	mv "$d/state/sequence" "$d/old-link"
+	ln -s "$d/elsewhere/created" "$d/state/sequence"
+	UUIDV7_STATE_DIR="$d/state" $cmd >/dev/null 2>&1
 	check "$name: a dangling symlink's target is not created" '[ ! -e "$d/elsewhere/created" ]'
 done
 

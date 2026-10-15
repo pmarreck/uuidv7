@@ -32,6 +32,7 @@ assert_eq() {
 
 # Isolate the shared counter state so the first call is a fresh tick.
 TMPDIR="$(mktemp -d)"; export TMPDIR
+UUIDV7_STATE_DIR="$TMPDIR/state"; export UUIDV7_STATE_DIR   # private counter state for this suite
 trap 'rm -rf "$TMPDIR"' EXIT
 
 # Fixed inputs: RFC A.6 millisecond + a deliberately bit-spread sub-ms nanosecond.

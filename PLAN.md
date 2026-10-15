@@ -12,10 +12,13 @@ Open work in priority order. Completed items: [docs/PLAN_LOG.md](docs/PLAN_LOG.m
 - [ ] Counter/daemon scope audit (Turing request 2026-10-14): state file and socket are found via TMPDIR/XDG_RUNTIME_DIR, so sharing is per matching environment; add deterministic regressions for differing TMPDIR, daemon/standalone transitions and unsafe shared /tmp, then fix within per-user scope (context: docs/plan_context/counter_scope.md)
 	- [x] Measure the boundaries: differing TMPDIR 20/40 out of order, nix develop sets a per-shell TMPDIR, unusable file falls back silently, socket uses a different lookup (done 2026-10-14 19:25 EDT)
 	- [x] Fix: state file written through a planted symlink (O_NOFOLLOW in both CLIs, tests/uuidv7_state_safety_test) (done 2026-10-14 19:21 EDT, 7746c5a)
-	- [ ] Per-user, environment-independent state and socket location, daemon owner check, and daemon state persistence covering crash/restart and concurrent file allocation (not just graceful write-back): waits on decision uuidv7-counter-scope
+	- [x] Per-user state directory from the OS account (home/.local/state/uuidv7, Local AppData on Windows), UUIDV7_STATE_DIR override; counter file and default socket both there (done 2026-10-15 13:00 EDT)
+	- [ ] Daemon clients refuse a socket owned by another user (SO_PEERCRED / getpeereid)
+	- [ ] Daemon state persistence covering crash/restart and concurrent file allocation: choose write-per-allocation vs durable reservation with BDFN
+- [ ] Plan cross-user machine-wide ordering (BDFN: later): system service, or a one-time admin-created group-owned 0660 state file (idea from the sibling os_counters project); bring a plan first
 
 ## Awaiting BDFN decisions (queued in the walking brief)
-- [ ] Decision uuidv7-counter-scope revision 1 (queued 2026-10-14): per-user home-directory state (recommended), per-user runtime directory, a system service, or defer
+- [x] Decision uuidv7-counter-scope: BDFN chose per user now, cross-user later (terminal answer, 2026-10-15 12:50 EDT)
 - [ ] Decision uuidv7-os-rng-failure-policy revision 2 (queued 2026-10-14): fail closed or keep the warn + clock-seeded fallback when the OS RNG fails
 
 ## Investigate
@@ -29,7 +32,5 @@ Open work in priority order. Completed items: [docs/PLAN_LOG.md](docs/PLAN_LOG.m
 - [ ] If uuidv7z gains batch output or a many-UUIDs-per-process library API: seed randomz's BLAKE3 DRBG once from OS entropy instead of a syscall per new tick (sibling-Zig import; mind fork duplication)
 
 ## Done (recent)
-- [x] Mechatron Prime CI targets manifest + badge; README platform table (done 2026-10-06 18:10 EDT, 39bb636)
-- [x] wasm32-freestanding core compiles with all exports; ReleaseSmall 7,047 bytes (done 2026-10-06 18:10 EDT)
 - [x] BDFN chose to fix the inherited CLI argument quirks (done 2026-10-06 23:08 EDT)
 - [x] Both CLIs: order-independent flags, last timestamp wins, unknown/extra arguments error, -- ends options, extract takes one UUID (done 2026-10-06 23:13 EDT, bede2d2)

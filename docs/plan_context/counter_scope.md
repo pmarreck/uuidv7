@@ -54,7 +54,14 @@ The two lookups differ, and both depend on environment variables.
 | Different users | no; with a shared `/tmp`, the first user's file blocks the others, who silently fall back |
 | Across reboot | no: `/tmp` is usually cleared; ordering then relies on the clock |
 
-## Proposed fix (awaiting BDFN decision)
+## Decision and status
+
+BDFN chose per user now, cross-user later (2026-10-15). Done: the per-user state
+directory below (both CLIs, daemon and clients; `tests/uuidv7_state_dir_test`).
+Open: the daemon owner check, daemon crash persistence, the unusable-file policy,
+and a plan for cross-user ordering.
+
+## Proposed fix
 
 Per-user scope that does not depend on the environment:
 

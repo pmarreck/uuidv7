@@ -5,6 +5,7 @@ export UUIDV7_NO_DAEMON=1
 
 # Isolate the cross-process counter state so static-timestamp tests are deterministic.
 TMPDIR="$(mktemp -d)"; export TMPDIR
+UUIDV7_STATE_DIR="$TMPDIR/state"; export UUIDV7_STATE_DIR   # private counter state for this suite
 trap 'rm -rf "$TMPDIR"' EXIT
 
 # Test for uuidv7 implementation

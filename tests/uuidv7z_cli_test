@@ -9,9 +9,10 @@ lua_cli=(luajit "$here/../bin/uuidv7")
 zig_cli="${UUIDV7Z:?set UUIDV7Z to the uuidv7z executable}"
 export UUIDV7_NO_DAEMON=1
 unset UUIDV7_NS_EXTRACT_OK
+TMPDIR="$(mktemp -d)"; export TMPDIR
 # A path with a space: the counter state file lives here.
-TMPDIR="$(mktemp -d)/state dir"; mkdir -p "$TMPDIR"; export TMPDIR
-trap 'rm -rf "$(dirname "$TMPDIR")"' EXIT
+UUIDV7_STATE_DIR="$TMPDIR/state dir"; export UUIDV7_STATE_DIR
+trap 'rm -rf "$TMPDIR"' EXIT
 
 tests=0 fails=0
 pass() { tests=$((tests + 1)); echo "✓ $1"; }
@@ -131,7 +132,7 @@ n=$(ordered_run 1700000000000000000)
 check "uuidv7z: 60 processes at one static ns strictly increasing ($n/60)" '[ "$n" = 60 ]'
 n=$(ordered_run)
 check "uuidv7z: 60 live processes strictly increasing ($n/60)" '[ "$n" = 60 ]'
-check "uuidv7z: counter state file is in TMPDIR (path with a space)" '[ -s "$TMPDIR/uuidv7-sequence" ]'
+check "uuidv7z: counter state file is in UUIDV7_STATE_DIR (path with a space)" '[ -s "$UUIDV7_STATE_DIR/sequence" ]'
 # Both CLIs share one locked state file, so machine-wide ordering holds even
 # when the two implementations alternate.
 # mixed_run <args...>: 60 processes alternating uuidv7 and uuidv7z; prints how
@@ -151,7 +152,7 @@ n=$(mixed_run 1700000000000000000)
 check "uuidv7 + uuidv7z alternating at one static ns strictly increasing ($n/60)" '[ "$n" = 60 ]'
 n=$(mixed_run)
 check "uuidv7 + uuidv7z alternating live strictly increasing ($n/60)" '[ "$n" = 60 ]'
-check "no separate uuidv7z state file" '[ ! -e "$TMPDIR/uuidv7z-sequence" ]'
+check "one state file, no per-implementation copy" '[ "$(find "$UUIDV7_STATE_DIR" -type f | wc -l)" -eq 1 ]'
 for w in 1 2 3 4 5 6 7 8; do
 	( for i in $(seq 1 20); do "$zig_cli" 1700000000000000000; done > "$TMPDIR/w$w" ) &
 done

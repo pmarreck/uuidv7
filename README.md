@@ -26,8 +26,8 @@ remain strictly ordered and unique.
 - **54-bit monotonic counter** in the rest of `rand_b` — random-initialized each
   nanosecond tick, incremented only on a same-nanosecond collision (so in practice every
   UUID still carries ~53 bits of fresh entropy). Cross-process via an exclusively locked
-  counter file (`flock` on Linux and macOS, `LockFileEx` on Windows), under
-  `$TMPDIR` (Windows: `%TMPDIR%`, `%TEMP%` or `%TMP%`)
+  counter file (`flock` on Linux and macOS, `LockFileEx` on Windows) in a per-user state
+  directory (see below)
 - **Clock-rollback safe** — freeze-and-increment keeps monotonicity regardless of how far
   the wall clock jumps back (the 54-bit counter can't overflow in any real window)
 - **Hyphenated or compact** output; **zero heavy deps** — just LuaJIT
@@ -43,7 +43,17 @@ remain strictly ordered and unique.
   cannot encode pre-1970 time, and an overflow must not silently become a wrong time).
   Options and the timestamp may come in any order (`uuidv7 123 --hyphen`); with several
   timestamps the last one wins, `--` ends option parsing, and any other argument exits 1.
-- `TMPDIR` — where the cross-process counter state lives (default `/tmp`).
+- Counter state lives in one private (0700) per-user directory found from the OS account,
+  never from `TMPDIR`, `HOME` or `XDG_*`, so every shell, Nix dev shell, cron job and
+  service of a user shares it: `<home>/.local/state/uuidv7/` on Linux and macOS (home from
+  the passwd entry of the effective user), `%LOCALAPPDATA%\uuidv7\` on Windows. It holds
+  the counter file `sequence` and the daemon socket `uuidv7.sock`, and survives reboots.
+  Ordering is per user: different accounts keep separate counters. Caveats: a home
+  directory shared between machines (NFS) shares the file across them, and the static
+  musl `uuidv7z` has no NSS modules (it reads `/etc/passwd`, or nscd if one runs), so for
+  accounts that exist only in a directory service it finds no home and falls back to a
+  per-process counter.
+- `UUIDV7_STATE_DIR` — use this directory instead (tests, deliberate isolation).
 - `UUIDV7_SILENCE_INSECURE_RANDOM=1` — mute the red stderr warning that fires if no secure
   RNG (`getrandom`/`getentropy`/`/dev/urandom`) is available and it must fall back to the
   non-cryptographic `math.random`.
@@ -97,8 +107,8 @@ bin/linux/x86_64/uuidv7z --hyphen
 that it cannot run the daemon (`--daemon`/`--api` are refused), has no `--test`, and
 `--about` prints its version and platform. Both CLIs keep machine-wide order:
 
-- Without a daemon they share one exclusively locked counter file,
-  `$TMPDIR/uuidv7-sequence` (same `<nanotime>:<counter>` text and the same
+- Without a daemon they share one exclusively locked counter file, `sequence` in the
+  per-user state directory (same `<nanotime>:<counter>` text and the same
   `flock`/`LockFileEx` locking).
 - With a `uuidv7 --daemon` running, `uuidv7z` is a client of it just as `uuidv7` is: live
   requests go to the daemon's one counter, with the same socket lookup, the same bounded
@@ -122,10 +132,10 @@ serve JavaScript hosts that cannot run LuaJIT; no such integration exists yet.
 ## Daemon
 
 `uuidv7 --daemon` runs a single-threaded, `poll(2)`-based **Unix-domain-socket** server
-(`${XDG_RUNTIME_DIR:-$TMPDIR}/uuidv7.sock`, mode `0600`). On Windows it uses Winsock's
-AF_UNIX sockets and `WSAPoll` (Windows 10 version 1803 or later), with the socket in
-`%TMPDIR%` or `%TEMP%` and the log in `%LOCALAPPDATA%\uuidv7\uuidv7.log`. Three things
-differ there. Access control comes from the per-user temp directory, because Winsock has
+(`uuidv7.sock` in the per-user state directory, or `$UUIDV7_SOCK`; mode `0600`). On Windows
+it uses Winsock's AF_UNIX sockets and `WSAPoll` (Windows 10 version 1803 or later), with the
+log in `%LOCALAPPDATA%\uuidv7\uuidv7.log`. Three things differ there. Access control comes
+from the per-user state directory, because Winsock has
 no file mode or peer-credential call for these sockets, so the log records no peer UID.
 Restart (`r`) hands the open listener to a new process instead of re-executing in place,
 so the PID changes. Ctrl-C ends the daemon immediately rather than running its shutdown

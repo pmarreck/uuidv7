@@ -7,6 +7,12 @@ export LUA_PATH="$here/lib/?.lua;;"
 export UUIDV7_TEST_FILE="$here/tests/uuidv7_test"
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) windows=1 ;; *) windows=0 ;; esac
 rc=0
+# A private counter state directory for every suite, so a run never touches the
+# user's real ~/.local/state/uuidv7 (only tests/uuidv7_state_dir_test checks that
+# default location, on purpose).
+state_root="$(mktemp -d)"
+export UUIDV7_STATE_DIR="$state_root/state"
+trap 'rm -rf "$state_root"' EXIT
 # Zig/C products for the differential suites. Preset UUIDV7Z and UUIDV7_ZIG_LIB
 # (e.g. cross-built artifacts for a Windows run) or let this build them now.
 if [ -z "${UUIDV7Z:-}" ] || [ -z "${UUIDV7_ZIG_LIB:-}" ]; then
@@ -37,6 +43,7 @@ fi
 "$here/tests/uuidv7_clock_test"  || rc=$?   # injected coarse/backward clock ordering
 "$here/tests/uuidv7_concurrency_test" || rc=$?   # concurrent CLI processes: unique + per-process ordered
 "$here/tests/uuidv7_state_safety_test" || rc=$?   # state file never followed through a planted symlink
+"$here/tests/uuidv7_state_dir_test" || rc=$?   # per-user state directory from the OS account, not TMPDIR/HOME
 "$here/tests/uuidv7_extract_test" || rc=$?   # timestamp extraction round-trip
 "$here/tests/uuidv7_windows_test" || rc=$?   # Windows CLI contract (n/a elsewhere)
 "$here/tests/uuidv7_differential_test" || rc=$?   # Zig core vs LuaJIT oracle through the C ABI

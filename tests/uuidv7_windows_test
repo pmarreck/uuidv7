@@ -11,6 +11,7 @@ esac
 
 export UUIDV7_NO_DAEMON=1
 TMPDIR="$(mktemp -d)"; export TMPDIR
+UUIDV7_STATE_DIR="$TMPDIR/state"; export UUIDV7_STATE_DIR   # private counter state for this suite
 trap 'rm -rf "$TMPDIR"' EXIT
 capture() { out="$("$@" 2>"$TMPDIR/stderr")"; rc=$?; err="$(cat "$TMPDIR/stderr")"; }
 

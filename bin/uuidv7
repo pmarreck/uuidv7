@@ -48,12 +48,17 @@ Arguments:
   given, the last one wins. After --, every argument is a timestamp. Any other
   argument is an error.
 
+State:
+  Strict ordering across processes comes from a locked counter file in a
+  per-user directory found from the user account, not from TMPDIR or HOME:
+  ~/.local/state/uuidv7/sequence (Windows: %LOCALAPPDATA%\uuidv7\sequence).
+  UUIDV7_STATE_DIR overrides the directory. The uuidv7z port shares it.
+
 Daemon:
-  `uuidv7 --daemon` serves UUIDv7s over a Unix socket
-  (${XDG_RUNTIME_DIR:-$TMPDIR}/uuidv7.sock, mode 0600). The plain CLI
-  transparently uses a running daemon for live generation. Send raw
-  protocol lines to the socket, e.g.:
-    echo 'c5' | nc -U "${XDG_RUNTIME_DIR:-$TMPDIR}/uuidv7.sock"
+  `uuidv7 --daemon` serves UUIDv7s over a Unix socket in that directory
+  (~/.local/state/uuidv7/uuidv7.sock). The plain CLI transparently uses a
+  running daemon for live generation. Send raw protocol lines to the socket, e.g.:
+    echo 'c5' | nc -U ~/.local/state/uuidv7/uuidv7.sock
   Protocol (newline-terminated, no spaces; tokens in any order):
     <empty> one compact    c<N> N uuids    - hyphenated
     tn<ns> / tm<ms> explicit time    * ephemeral (requires tn/tm)
@@ -62,7 +67,7 @@ Daemon:
   When a daemon is reachable the CLI gets its UUID from it and NEVER silently
   generates locally (that uses a separate counter and could break monotonicity):
   it retries with tiny exponential backoff, then errors. Tune/disable via env.
-  Env: UUIDV7_SOCK, UUIDV7_MAX_BATCH(=1000), UUIDV7_SILENCE_INSECURE_RANDOM,
+  Env: UUIDV7_STATE_DIR, UUIDV7_SOCK, UUIDV7_MAX_BATCH(=1000), UUIDV7_SILENCE_INSECURE_RANDOM,
        UUIDV7_LOG / XDG_STATE_HOME (JSONL log location), UUIDV7_NS_EXTRACT_OK,
        UUIDV7_DAEMON_RETRIES(=20), UUIDV7_DAEMON_RETRY_TIMEOUT_US(=2000),
        UUIDV7_DAEMON_NO_RETRY (error instead of retry).

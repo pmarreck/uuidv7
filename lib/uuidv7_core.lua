@@ -210,15 +210,91 @@ function MemoryCounter:get_next(current_nt, is_static, random_u64)
 	return eff, ctr, kind
 end
 
--- Filesystem (Linux and macOS CLI default): flock'd file under $TMPDIR, atomic cross-process RMW.
+-- ===== per-user state directory =====
+-- The counter file and the daemon socket live in one directory found from the OS
+-- account, never from TMPDIR, HOME or XDG_* (those differ between shells, Nix dev
+-- shells, cron and services, which would split the counter): the passwd home's
+-- .local/state/uuidv7 on Linux and macOS, Local AppData\uuidv7 on Windows.
+-- UUIDV7_STATE_DIR overrides it (tests, deliberate isolation).
+if is_windows then
+	ffi.cdef[[
+		int SHGetFolderPathA(void *hwnd, int csidl, void *token, uint32_t flags, char *path);
+		int CreateDirectoryA(const char *path, void *sa);
+	]]
+else
+	if is_macos then
+		ffi.cdef[[ struct uuidv7_passwd { char *pw_name; char *pw_passwd; uint32_t pw_uid; uint32_t pw_gid;
+			long pw_change; char *pw_class; char *pw_gecos; char *pw_dir; char *pw_shell; long pw_expire; }; ]]
+	else
+		ffi.cdef[[ struct uuidv7_passwd { char *pw_name; char *pw_passwd; uint32_t pw_uid; uint32_t pw_gid;
+			char *pw_gecos; char *pw_dir; char *pw_shell; }; ]]
+	end
+	ffi.cdef[[ uint32_t geteuid(void); struct uuidv7_passwd *getpwuid(uint32_t uid); ]]
+end
+local CSIDL_LOCAL_APPDATA = 0x1c
+local STATE_DIR_MODE = 448   -- 0700
+
+-- The state directory path (not created), or nil when the account has none.
+function M.state_dir()
+	local o = os.getenv("UUIDV7_STATE_DIR")
+	if o and o ~= "" then return (o:gsub("[/\\]+$", "")) end
+	if is_windows then
+		local buf = ffi.new("char[260]")
+		local ok, rc = pcall(function() return ffi.load("shell32").SHGetFolderPathA(nil, CSIDL_LOCAL_APPDATA, nil, 0, buf) end)
+		if not ok or rc ~= 0 then return nil end
+		return ffi.string(buf) .. "\\uuidv7"
+	end
+	local pw = C.getpwuid(C.geteuid())
+	if pw == nil or pw.pw_dir == nil then return nil end
+	local home = ffi.string(pw.pw_dir):gsub("/+$", "")
+	if home == "" then return nil end
+	return home .. "/.local/state/uuidv7"
+end
+
+-- Create the directory and any missing parents, private to the user (0700 on
+-- POSIX; Windows directories under Local AppData inherit the user's ACL).
+-- Existing directories are left as they are.
+function M.ensure_dir(dir)
+	local prefix = ""
+	for part, sep in dir:gmatch("([^/\\]*)([/\\]?)") do
+		prefix = prefix .. part
+		if part ~= "" and not part:match("^%a:$") then
+			if is_windows then C.CreateDirectoryA(prefix, nil) else C.mkdir(prefix, STATE_DIR_MODE) end
+		end
+		prefix = prefix .. sep
+		if sep == "" then break end
+	end
+end
+
+-- Path of a file in the state directory, or nil.
+function M.state_file(name)
+	local dir = M.state_dir()
+	return dir and (dir .. "/" .. name)
+end
+
+-- Open-or-create the state file; on a first failure create the directory and retry.
+local function open_state(path, open_once)
+	local h = open_once(path)
+	if h then return h end
+	local dir = path:match("^(.*)[/\\][^/\\]+$")
+	if dir and dir ~= "" then M.ensure_dir(dir) end
+	return open_once(path)
+end
+
+-- Filesystem (Linux and macOS CLI default): flock'd file in the state directory, atomic cross-process RMW.
 local FsCounter = {}
 FsCounter.__index = FsCounter
 function FsCounter:new()
-	local tmp = (os.getenv("TMPDIR") or "/tmp"):gsub("/+$", "")
-	return setmetatable({ filepath = tmp .. "/uuidv7-sequence", _nt = nil, _ctr = nil }, self)
+	return setmetatable({ filepath = M.state_file("sequence"), _nt = nil, _ctr = nil }, self)
 end
 function FsCounter:get_next(current_nt, is_static, random_u64)
-	local fd = C.open(self.filepath, bit.bor(O_CREAT, O_RDWR, O_NOFOLLOW), ffi.new("int", 438))
+	local fd = -1
+	if self.filepath then
+		fd = open_state(self.filepath, function(p)
+			local f = C.open(p, bit.bor(O_CREAT, O_RDWR, O_NOFOLLOW), ffi.new("int", 384))   -- 0600
+			return f >= 0 and f or nil
+		end) or -1
+	end
 	if fd < 0 then
 		self._nt, self._ctr = advance(self._nt, self._ctr, current_nt, is_static, random_u64)
 		return self._nt, self._ctr, "new"
@@ -249,13 +325,19 @@ end
 local WinCounter = {}
 WinCounter.__index = WinCounter
 function WinCounter:new()
-	local dir = os.getenv("TMPDIR") or os.getenv("TEMP") or os.getenv("TMP") or "."
-	return setmetatable({ filepath = dir:gsub("[/\\]+$", "") .. "\\uuidv7-sequence", _nt = nil, _ctr = nil }, self)
+	return setmetatable({ filepath = M.state_file("sequence"), _nt = nil, _ctr = nil }, self)
 end
 function WinCounter:get_next(current_nt, is_static, random_u64)
 	local GENERIC_RW, SHARE_RW, OPEN_ALWAYS, LOCKFILE_EXCLUSIVE = 0xC0000000, 3, 4, 2
-	local h = C.CreateFileA(self.filepath, GENERIC_RW, SHARE_RW, nil, OPEN_ALWAYS, 0x80, nil)
-	if ffi.cast("intptr_t", h) == -1 then
+	local h = nil
+	if self.filepath then
+		h = open_state(self.filepath, function(p)
+			local r = C.CreateFileA(p, GENERIC_RW, SHARE_RW, nil, OPEN_ALWAYS, 0x80, nil)
+			if ffi.cast("intptr_t", r) == -1 then return nil end
+			return r
+		end)
+	end
+	if h == nil then
 		self._nt, self._ctr = advance(self._nt, self._ctr, current_nt, is_static, random_u64)
 		return self._nt, self._ctr, "new"
 	end

@@ -20,11 +20,12 @@ local server   -- per-run state
 -- ===== paths =====
 local function strip_slash(p) return (p:gsub("/+$", "")) end
 
+-- $UUIDV7_SOCK, else uuidv7.sock in the per-user state directory, the same
+-- lookup the clients use (see core.state_dir).
 local function socket_path()
 	if os.getenv("UUIDV7_SOCK") then return os.getenv("UUIDV7_SOCK") end
-	local base = os.getenv("XDG_RUNTIME_DIR") or os.getenv("TMPDIR")
-		or (is_windows and (os.getenv("TEMP") or os.getenv("TMP"))) or "/tmp"
-	return strip_slash(base) .. "/uuidv7.sock"
+	return assert(core.state_file("uuidv7.sock"),
+		"no per-user state directory for the socket; set UUIDV7_STATE_DIR or UUIDV7_SOCK")
 end
 
 local function log_path()
@@ -335,7 +336,8 @@ local function make_listener()
 	if adopted then return net.adopt(tonumber(adopted)), true end
 	local path = server.sock_path
 	assert(#path <= net.MAX_PATH, "socket path too long: " .. path)
-	ensure_dir(path)
+	local dir = path:match("^(.*)[/\\][^/\\]+$")
+	if dir and dir ~= "" then core.ensure_dir(dir) end
 	local fd, err = net.listen(path)
 	assert(fd, err)
 	return fd, false

@@ -7,11 +7,10 @@ local net = require("uuidv7_net")     -- sockets + sleep, POSIX or Winsock
 
 local M = {}
 
+-- $UUIDV7_SOCK, else uuidv7.sock in the per-user state directory (see core.state_dir).
 local function default_path()
 	if os.getenv("UUIDV7_SOCK") then return os.getenv("UUIDV7_SOCK") end
-	local base = os.getenv("XDG_RUNTIME_DIR") or os.getenv("TMPDIR")
-		or (net.is_windows and (os.getenv("TEMP") or os.getenv("TMP"))) or "/tmp"
-	return (base:gsub("/+$", "")) .. "/uuidv7.sock"
+	return core.state_file("uuidv7.sock") or ""
 end
 M.default_path = default_path
 

@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Where the shared counter state lives. Both CLIs (and the daemon socket) use one
+# per-user directory found from the OS account, never from TMPDIR, HOME or XDG_*:
+# <home>/.local/state/uuidv7 on Linux and macOS, <Local AppData>\uuidv7 on
+# Windows. UUIDV7_STATE_DIR overrides it (tests, deliberate isolation).
+set -u
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export UUIDV7_NO_DAEMON=1 UUIDV7_SILENCE_INSECURE_RANDOM=1
+T="$(mktemp -d)"
+trap 'rm -rf "$T"' EXIT
+lua=(luajit "$here/../bin/uuidv7")
+zig="${UUIDV7Z:-}"
+
+tests=0 fails=0
+check() {
+	tests=$((tests + 1))
+	if eval "$2"; then echo "✓ $1"; else fails=$((fails + 1)); echo "✗ $1" >&2; fi
+}
+if [ -z "$zig" ]; then echo "✗ UUIDV7Z is not set; uuidv7z not checked" >&2; exit 1; fi
+is_windows=0
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) is_windows=1 ;; esac
+S=1700000000000000000
+
+# ---- override: created on demand, private, and the only thing that matters ----
+st="$T/a/b/state"
+UUIDV7_STATE_DIR="$st" TMPDIR="$T/tmp1" "${lua[@]}" "$S" >/dev/null
+check "override: the LuaJIT CLI creates the state directory and its sequence file" '[ -s "$st/sequence" ]'
+if [ "$is_windows" -eq 0 ]; then
+	check "override: the state directory is private (0700)" '[ "$(stat -c %a "$st" 2>/dev/null || stat -f %Lp "$st" 2>/dev/null)" = 700 ]'
+fi
+mkdir -p "$T/tmp1" "$T/tmp2"
+prev="" bad=0
+for i in $(seq 1 20); do
+	for impl in lua zig; do
+		tmp="$T/tmp1"; [ "$impl" = zig ] && tmp="$T/tmp2"
+		if [ "$impl" = lua ]; then cur="$(UUIDV7_STATE_DIR="$st" TMPDIR="$tmp" "${lua[@]}" "$S")"
+		else cur="$(UUIDV7_STATE_DIR="$st" TMPDIR="$tmp" "$zig" "$S")"; fi
+		[[ "$cur" > "$prev" ]] || bad=$((bad + 1))
+		prev="$cur"
+	done
+done
+check "different TMPDIR, one state directory: 40 alternating values strictly increase ($bad out of order)" '[ "$bad" -eq 0 ]'
+check "nothing is written to TMPDIR" '[ -z "$(find "$T/tmp1" "$T/tmp2" -mindepth 1)" ]'
+out="$(UUIDV7_STATE_DIR="$st" "${lua[@]}" --api PING 2>&1)"
+# Git Bash hands native programs a Windows form of the path, so match its tail there.
+want="$st/uuidv7.sock"; [ "$is_windows" -eq 1 ] && want="state/uuidv7.sock"
+check "the default daemon socket is in the state directory" '[[ "$out" == *"no daemon reachable at "*"$want"* ]]'
+
+# ---- default: from the OS account, regardless of TMPDIR, HOME and XDG_* ----
+if [ "$is_windows" -eq 1 ]; then
+	def="$(cygpath -u "$LOCALAPPDATA")/uuidv7"
+else
+	def="$(eval echo "~$(id -un)")/.local/state/uuidv7"
+fi
+if mkdir -p "$def" 2>/dev/null && [ -w "$def" ]; then
+	scramble=(env -u UUIDV7_STATE_DIR -u XDG_STATE_HOME -u XDG_RUNTIME_DIR HOME="$T/fakehome" TMPDIR="$T/tmp1" LOCALAPPDATA="$T/fakeappdata")
+	"${scramble[@]}" "${lua[@]}" "$S" >/dev/null
+	a="$(cat "$def/sequence" 2>/dev/null)"
+	"${scramble[@]}" "$zig" "$S" >/dev/null
+	b="$(cat "$def/sequence" 2>/dev/null)"
+	check "default: the LuaJIT CLI writes <account home>/.local/state/uuidv7/sequence despite HOME/TMPDIR/XDG" '[[ "$a" == "$S:"* ]]'
+	check "default: uuidv7z advances the same file ($a -> $b)" '[ "${b%%:*}" = "$S" ] && [ "${b#*:}" -gt "${a#*:}" ]'
+else
+	echo "✗ default state directory $def is not writable here; default-location checks not run" >&2
+	fails=$((fails + 1))
+fi
+
+echo "$((tests - fails))/$tests state-directory tests passed"
+[ "$fails" -eq 0 ]
