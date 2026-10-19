@@ -337,7 +337,14 @@ local function make_listener()
 	local path = server.sock_path
 	assert(#path <= net.MAX_PATH, "socket path too long: " .. path)
 	local dir = path:match("^(.*)[/\\][^/\\]+$")
-	if dir and dir ~= "" then core.ensure_dir(dir) end
+	if not os.getenv("UUIDV7_SOCK") and not is_windows then
+		-- The default socket lives in the shared /tmp: only in a verified private directory.
+		local dfd = assert(core.open_private_dir(dir), "state directory " .. dir ..
+			" is not a private directory owned by this user; refusing to listen there")
+		ffi.C.close(dfd)
+	elseif dir and dir ~= "" then
+		core.ensure_dir(dir)
+	end
 	local fd, err = net.listen(path)
 	assert(fd, err)
 	return fd, false

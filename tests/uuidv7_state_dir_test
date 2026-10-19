@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # Where the shared counter state lives. Both CLIs (and the daemon socket) use one
-# per-user directory found from the OS account, never from TMPDIR, HOME or XDG_*:
-# <home>/.local/state/uuidv7 on Linux and macOS, <Local AppData>\uuidv7 on
-# Windows. UUIDV7_STATE_DIR overrides it (tests, deliberate isolation).
+# per-user directory in RAM-backed temporary storage at a fixed path, never taken
+# from TMPDIR, HOME or XDG_* (those differ between shells, Nix dev shells, cron and
+# services): /tmp/uuidv7-<uid> on Linux and macOS,
+# <Local AppData>\Temp\uuidv7 on Windows. UUIDV7_STATE_DIR overrides it. In a
+# shared directory it is used only if it is a real directory, owned by the user,
+# with mode 0700.
 set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export UUIDV7_NO_DAEMON=1 UUIDV7_SILENCE_INSECURE_RANDOM=1
@@ -46,22 +49,35 @@ out="$(UUIDV7_STATE_DIR="$st" "${lua[@]}" --api PING 2>&1)"
 want="$st/uuidv7.sock"; [ "$is_windows" -eq 1 ] && want="state/uuidv7.sock"
 check "the default daemon socket is in the state directory" '[[ "$out" == *"no daemon reachable at "*"$want"* ]]'
 
-# ---- default: from the OS account, regardless of TMPDIR, HOME and XDG_* ----
-if [ "$is_windows" -eq 1 ]; then
-	def="$(cygpath -u "$LOCALAPPDATA")/uuidv7"
-else
-	def="$(eval echo "~$(id -un)")/.local/state/uuidv7"
+# ---- a state directory that others could control is never used ----
+if [ "$is_windows" -eq 0 ]; then
+	for impl in lua zig; do
+		if [ "$impl" = lua ]; then run=("${lua[@]}"); else run=("$zig"); fi
+		open_dir="$T/$impl-open"; mkdir -p "$open_dir"; chmod 0777 "$open_dir"
+		out="$(UUIDV7_STATE_DIR="$open_dir" "${run[@]}" 2>/dev/null)"; rc=$?
+		check "$impl: a group/world-writable state directory is not used" '[ ! -e "$open_dir/sequence" ]'
+		check "$impl: ... and generation still succeeds" '[ "$rc" -eq 0 ] && [[ "$out" =~ ^[0-9a-f]{32}$ ]]'
+		real="$T/$impl-real"; mkdir -p "$real"; chmod 0700 "$real"; ln -s "$real" "$T/$impl-link"
+		UUIDV7_STATE_DIR="$T/$impl-link" "${run[@]}" >/dev/null 2>&1
+		check "$impl: a symlinked state directory is not followed" '[ ! -e "$real/sequence" ]'
+	done
 fi
-if mkdir -p "$def" 2>/dev/null && [ -w "$def" ]; then
+
+# ---- default: a fixed RAM-backed path, regardless of TMPDIR, HOME and XDG_* ----
+case "$(uname -s)" in
+	Linux|Darwin) base=/tmp; def="$base/uuidv7-$(id -u)" ;;
+	*) base="$(cygpath -u "$LOCALAPPDATA")/Temp"; def="$base/uuidv7" ;;
+esac
+if [ -d "$base" ] && [ -w "$base" ]; then
 	scramble=(env -u UUIDV7_STATE_DIR -u XDG_STATE_HOME -u XDG_RUNTIME_DIR HOME="$T/fakehome" TMPDIR="$T/tmp1" LOCALAPPDATA="$T/fakeappdata")
 	"${scramble[@]}" "${lua[@]}" "$S" >/dev/null
 	a="$(cat "$def/sequence" 2>/dev/null)"
 	"${scramble[@]}" "$zig" "$S" >/dev/null
 	b="$(cat "$def/sequence" 2>/dev/null)"
-	check "default: the LuaJIT CLI writes <account home>/.local/state/uuidv7/sequence despite HOME/TMPDIR/XDG" '[[ "$a" == "$S:"* ]]'
+	check "default: the LuaJIT CLI writes $def/sequence despite HOME/TMPDIR/XDG/LOCALAPPDATA" '[[ "$a" == "$S:"* ]]'
 	check "default: uuidv7z advances the same file ($a -> $b)" '[ "${b%%:*}" = "$S" ] && [ "${b#*:}" -gt "${a#*:}" ]'
 else
-	echo "✗ default state directory $def is not writable here; default-location checks not run" >&2
+	echo "✗ $base is not a writable directory here; default-location checks not run" >&2
 	fails=$((fails + 1))
 fi
 

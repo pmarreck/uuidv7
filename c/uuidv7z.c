@@ -30,7 +30,6 @@
 #include <wchar.h>
 #else
 #include <fcntl.h>
-#include <pwd.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -44,6 +43,7 @@
 
 #define PROG "uuidv7z"
 #define STATE_FILE "sequence"
+#define MAX_STATE_PATH 1024
 
 #if defined(__x86_64__) || defined(_M_X64)
 #define ARCH "x86_64"
@@ -117,83 +117,81 @@ static uint64_t random_u64(void) {
 
 /* ---- per-user state directory ---- */
 
-/* The directory holding the counter file and the daemon socket, found from the
- * OS account and never from TMPDIR, HOME or XDG_* (those differ between shells,
- * Nix dev shells, cron and services): the passwd home's .local/state/uuidv7 on
- * Linux and macOS, Local AppData\uuidv7 on Windows; $UUIDV7_STATE_DIR overrides
- * it. Same lookup as core.state_dir in the LuaJIT CLI. NULL if there is none.
- * Caller frees. */
+/* The directory holding the counter file and the daemon socket, at a fixed path
+ * never taken from TMPDIR, HOME or XDG_* (those differ between shells, Nix dev
+ * shells, cron and services): /tmp/uuidv7-<uid> on Linux and macOS, and
+ * <Local AppData>\Temp\uuidv7 on Windows; $UUIDV7_STATE_DIR overrides it. Same
+ * lookup as core.state_dir in the LuaJIT CLI. NULL if there is none. Caller frees. */
 static char *state_dir(void) {
 	const char *o = getenv("UUIDV7_STATE_DIR");
-	const char *base, *suffix;
+	char buf[MAX_STATE_PATH];
 	if (o && *o) {
-		base = o;
-		suffix = "";
-	} else {
-#ifdef _WIN32
-		static char appdata[MAX_PATH];
-		if (SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, appdata) != S_OK) return NULL;
-		base = appdata;
-		suffix = "\\uuidv7";
-#else
-		struct passwd *pw = getpwuid(geteuid());
-		if (!pw || !pw->pw_dir || !*pw->pw_dir) return NULL;
-		base = pw->pw_dir;
-		suffix = "/.local/state/uuidv7";
-#endif
+		size_t ol = strlen(o);
+		while (ol > 0 && (o[ol - 1] == '/' || o[ol - 1] == '\\')) ol--;
+		if (ol == 0) return NULL;
+		char *d = malloc(ol + 1);
+		if (!d) die(PROG ": out of memory\n");
+		memcpy(d, o, ol);
+		d[ol] = 0;
+		return d;
 	}
-	size_t bl = strlen(base);
-	while (bl > 0 && (base[bl - 1] == '/' || base[bl - 1] == '\\')) bl--;
-	if (bl == 0) return NULL;
-	char *d = malloc(bl + strlen(suffix) + 1);
+#ifdef _WIN32
+	char appdata[MAX_PATH];
+	if (SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, appdata) != S_OK) return NULL;
+	snprintf(buf, sizeof buf, "%s\\Temp\\uuidv7", appdata);
+#else
+	snprintf(buf, sizeof buf, "/tmp/uuidv7-%lu", (unsigned long)geteuid());
+#endif
+	char *d = malloc(strlen(buf) + 1);
 	if (!d) die(PROG ": out of memory\n");
-	memcpy(d, base, bl);
-	strcpy(d + bl, suffix);
-	return d;
+	return strcpy(d, buf);
 }
 
-/* <state dir>/<name>, or NULL. Caller frees. */
-static char *state_file(const char *name) {
-	char *dir = state_dir();
-	if (!dir) return NULL;
-	size_t dl = strlen(dir);
-	char *p = realloc(dir, dl + 1 + strlen(name) + 1);
-	if (!p) die(PROG ": out of memory\n");
-	p[dl] = '/';
-	strcpy(p + dl + 1, name);
-	return p;
-}
-
-/* Create the parent directory of `path` and its missing ancestors, private to
- * the user (0700; Windows directories inherit the Local AppData ACL). Existing
- * directories are left alone. */
-static void ensure_parent_dir(const char *path) {
-	size_t len = strlen(path);
+/* Create `dir` and its missing ancestors (0700 on POSIX; Windows directories
+ * inherit the per-user Local AppData ACL). Existing directories are kept. */
+static void ensure_dir(const char *dir) {
+	size_t len = strlen(dir);
 	char *buf = malloc(len + 1);
 	if (!buf) die(PROG ": out of memory\n");
-	memcpy(buf, path, len + 1);
-	char *last = NULL;
-	for (char *c = buf; *c; c++) if (*c == '/' || *c == '\\') last = c;
-	if (last) {
-		*last = 0;
-		for (char *c = buf + 1; ; c++) {
-			if (*c == '/' || *c == '\\' || *c == 0) {
-				char saved = *c;
-				*c = 0;
-				if (!(c - buf == 2 && buf[1] == ':')) {
+	memcpy(buf, dir, len + 1);
+	for (char *c = buf + 1; ; c++) {
+		if (*c == '/' || *c == '\\' || *c == 0) {
+			char saved = *c;
+			*c = 0;
+			if (!(c - buf == 2 && buf[1] == ':')) {
 #ifdef _WIN32
-					CreateDirectoryA(buf, NULL);
+				CreateDirectoryA(buf, NULL);
 #else
-					mkdir(buf, 0700);
+				mkdir(buf, 0700);
 #endif
-				}
-				*c = saved;
-				if (saved == 0) break;
 			}
+			*c = saved;
+			if (saved == 0) break;
 		}
 	}
 	free(buf);
 }
+
+#ifndef _WIN32
+/* Create `dir` if needed and open it; -1 unless it is a real directory (not a
+ * symlink) owned by the effective user with no group or other permissions. /tmp
+ * is shared, so anyone could create the name first. The fd anchors openat(), so
+ * the checked directory is the one used. */
+static int open_private_dir(const char *dir) {
+	int fd = open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+	if (fd < 0) {
+		ensure_dir(dir);
+		fd = open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+	}
+	if (fd < 0) return -1;
+	struct stat st;
+	if (fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 077) != 0) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+#endif
 
 /* ---- counter state: one exclusively locked file shared by all processes ---- */
 
@@ -206,15 +204,20 @@ static uuidv7_state next_state(int64_t current, int is_static) {
 	char text[UUIDV7_STATE_TEXT_MAX + 16];
 	size_t text_len = 0;
 	uint64_t seed = random_u64();
-	char *path = state_file(STATE_FILE);
+	char *dir = state_dir();
 #ifdef _WIN32
+	/* FILE_ATTRIBUTE_TEMPORARY asks the cache manager to keep the file in memory. */
 	HANDLE h = INVALID_HANDLE_VALUE;
-	for (int attempt = 0; path && attempt < 2 && h == INVALID_HANDLE_VALUE; attempt++) {
-		if (attempt) ensure_parent_dir(path);
-		h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-			OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (dir) {
+		char path[MAX_STATE_PATH];
+		snprintf(path, sizeof path, "%s/%s", dir, STATE_FILE);
+		for (int attempt = 0; attempt < 2 && h == INVALID_HANDLE_VALUE; attempt++) {
+			if (attempt) ensure_dir(dir);
+			h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+				OPEN_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
+		}
+		free(dir);
 	}
-	free(path);
 	if (h != INVALID_HANDLE_VALUE) {
 		OVERLAPPED ov;
 		memset(&ov, 0, sizeof ov);
@@ -236,14 +239,17 @@ static uuidv7_state next_state(int64_t current, int is_static) {
 		CloseHandle(h);
 	}
 #else
-	/* O_NOFOLLOW: a symlink planted at the state path is refused, never written
-	 * through. On a first failure, create the state directory and retry. */
+	/* Opened inside the verified private directory; O_NOFOLLOW refuses a
+	 * symlink at the file name too. */
 	int fd = -1;
-	for (int attempt = 0; path && attempt < 2 && fd < 0; attempt++) {
-		if (attempt) ensure_parent_dir(path);
-		fd = open(path, O_CREAT | O_RDWR | O_NOFOLLOW, 0600);
+	if (dir) {
+		int dfd = open_private_dir(dir);
+		free(dir);
+		if (dfd >= 0) {
+			fd = openat(dfd, STATE_FILE, O_CREAT | O_RDWR | O_NOFOLLOW, 0600);
+			close(dfd);
+		}
 	}
-	free(path);
 	if (fd >= 0) {
 		if (flock(fd, LOCK_EX) == 0) {
 			ssize_t n = pread(fd, text, sizeof text - 1, 0);
@@ -302,8 +308,9 @@ typedef int sock_t;
 #define DAEMON_REPLY_MAX 4096
 
 /* The daemon's socket: $UUIDV7_SOCK, else uuidv7.sock in the state directory,
- * the same lookup as the LuaJIT client and daemon. NULL if there is none.
- * Caller frees. */
+ * the same lookup as the LuaJIT client and daemon. On POSIX a state directory
+ * that is not private to this user gives NULL (no daemon), so a socket planted
+ * by someone else is never used. Caller frees. */
 static char *daemon_socket_path(void) {
 	const char *sock = getenv("UUIDV7_SOCK");
 	if (sock) {
@@ -311,7 +318,18 @@ static char *daemon_socket_path(void) {
 		if (!p) die(PROG ": out of memory\n");
 		return strcpy(p, sock);
 	}
-	return state_file("uuidv7.sock");
+	char *dir = state_dir();
+	if (!dir) return NULL;
+#ifndef _WIN32
+	int dfd = open_private_dir(dir);
+	if (dfd < 0) { free(dir); return NULL; }
+	close(dfd);
+#endif
+	size_t dl = strlen(dir);
+	char *p = realloc(dir, dl + sizeof "/uuidv7.sock");
+	if (!p) die(PROG ": out of memory\n");
+	strcpy(p + dl, "/uuidv7.sock");
+	return p;
 }
 
 /* One request on a fresh connection: send `line` plus a newline, half-close,
@@ -494,12 +512,13 @@ static void show_help(void) {
 		"  argument is an error.\n"
 		"\n"
 		"Strict ordering across processes comes from an exclusively locked counter file,\n"
-		"~/.local/state/uuidv7/sequence (Windows: %LOCALAPPDATA%\\uuidv7\\sequence), found\n"
-		"from the user account rather than TMPDIR or HOME and shared with the LuaJIT\n"
-		"`uuidv7`; UUIDV7_STATE_DIR overrides the directory. When a `uuidv7 --daemon` is running, live generation is served\n"
-		"by it, so both CLIs draw from one counter; explicit timestamps stay local. If a\n"
-		"reachable daemon will not serve, uuidv7z retries it and then exits 1 rather than\n"
-		"generating locally. Only the LuaJIT `uuidv7` runs the daemon (--daemon, --api).\n"
+		"/tmp/uuidv7-<uid>/sequence (Windows: %LOCALAPPDATA%\\Temp\\uuidv7\\sequence), at a\n"
+		"fixed path rather than TMPDIR or HOME, and shared with the LuaJIT `uuidv7`;\n"
+		"UUIDV7_STATE_DIR overrides the directory. When a `uuidv7 --daemon` is running,\n"
+		"live generation is served by it, so both CLIs draw from one counter; explicit\n"
+		"timestamps stay local. If a reachable daemon will not serve, uuidv7z retries it\n"
+		"and then exits 1 rather than generating locally. Only the LuaJIT `uuidv7` runs\n"
+		"the daemon (--daemon, --api).\n"
 		"Env: UUIDV7_STATE_DIR, UUIDV7_SOCK, UUIDV7_NO_DAEMON, UUIDV7_DAEMON_RETRIES,\n"
 		"  UUIDV7_DAEMON_RETRY_TIMEOUT_US, UUIDV7_DAEMON_NO_RETRY, UUIDV7_NS_EXTRACT_OK,\n"
 		"  UUIDV7_SILENCE_INSECURE_RANDOM.\n"

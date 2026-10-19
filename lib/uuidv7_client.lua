@@ -7,10 +7,19 @@ local net = require("uuidv7_net")     -- sockets + sleep, POSIX or Winsock
 
 local M = {}
 
--- $UUIDV7_SOCK, else uuidv7.sock in the per-user state directory (see core.state_dir).
+-- $UUIDV7_SOCK, else uuidv7.sock in the per-user state directory (see
+-- core.state_dir). On POSIX a state directory that is not private to this user
+-- yields "" (no daemon), so a socket planted by someone else is never used.
 local function default_path()
 	if os.getenv("UUIDV7_SOCK") then return os.getenv("UUIDV7_SOCK") end
-	return core.state_file("uuidv7.sock") or ""
+	local dir = core.state_dir()
+	if not dir then return "" end
+	if not net.is_windows then
+		local dfd = core.open_private_dir(dir)
+		if not dfd then return "" end
+		ffi.C.close(dfd)
+	end
+	return dir .. "/uuidv7.sock"
 end
 M.default_path = default_path
 

@@ -52,10 +52,12 @@ C ABI that other programs can embed.
   both implementations share one counter and the Zig CLI uses a running daemon.
 - Windows gets the daemon (BDFN, 2026-10-14): Winsock AF_UNIX sockets and WSAPoll,
   with a Windows-compatible restart mechanism.
-- Counter scope (BDFN, 2026-10-15): one counter per user account now, found from the
-  OS account rather than the environment and kept across reboots; ordering across
-  user accounts comes later, after a separate plan (a system service or an
-  admin-created shared group file).
+- Counter scope (BDFN, 2026-10-15): one counter per user account now, at a fixed path
+  rather than one taken from the environment; ordering across user accounts comes
+  later, after a separate plan (a system service or an admin-created shared group file).
+- State stays in RAM (BDFN, 2026-10-19): no per-call writes to physical disk, so the
+  state lives in /tmp/uuidv7-<uid> (tmpfs or a RAM disk on the target machines) and
+  does not survive a reboot.
 
 ## Open questions
 

@@ -12,7 +12,7 @@ Open work in priority order. Completed items: [docs/PLAN_LOG.md](docs/PLAN_LOG.m
 - [ ] Counter/daemon scope audit (Turing request 2026-10-14): state file and socket are found via TMPDIR/XDG_RUNTIME_DIR, so sharing is per matching environment; add deterministic regressions for differing TMPDIR, daemon/standalone transitions and unsafe shared /tmp, then fix within per-user scope (context: docs/plan_context/counter_scope.md)
 	- [x] Measure the boundaries: differing TMPDIR 20/40 out of order, nix develop sets a per-shell TMPDIR, unusable file falls back silently, socket uses a different lookup (done 2026-10-14 19:25 EDT)
 	- [x] Fix: state file written through a planted symlink (O_NOFOLLOW in both CLIs, tests/uuidv7_state_safety_test) (done 2026-10-14 19:21 EDT, 7746c5a)
-	- [x] Per-user state directory from the OS account (home/.local/state/uuidv7, Local AppData on Windows), UUIDV7_STATE_DIR override; counter file and default socket both there (done 2026-10-15 13:00 EDT)
+	- [x] Per-user state directory at a fixed RAM-backed path (/tmp/uuidv7-<uid>, verified 0700 and owned; Local AppData\Temp\uuidv7 with FILE_ATTRIBUTE_TEMPORARY on Windows), UUIDV7_STATE_DIR override; counter file and default socket both there (done 2026-10-19 19:58 EDT)
 	- [ ] Daemon clients refuse a socket owned by another user (SO_PEERCRED / getpeereid)
 	- [ ] Daemon state persistence covering crash/restart and concurrent file allocation: choose write-per-allocation vs durable reservation with BDFN
 - [ ] Plan cross-user machine-wide ordering (BDFN: later): system service, or a one-time admin-created group-owned 0660 state file (idea from the sibling os_counters project); bring a plan first

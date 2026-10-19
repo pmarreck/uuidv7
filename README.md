@@ -43,16 +43,19 @@ remain strictly ordered and unique.
   cannot encode pre-1970 time, and an overflow must not silently become a wrong time).
   Options and the timestamp may come in any order (`uuidv7 123 --hyphen`); with several
   timestamps the last one wins, `--` ends option parsing, and any other argument exits 1.
-- Counter state lives in one private (0700) per-user directory found from the OS account,
-  never from `TMPDIR`, `HOME` or `XDG_*`, so every shell, Nix dev shell, cron job and
-  service of a user shares it: `<home>/.local/state/uuidv7/` on Linux and macOS (home from
-  the passwd entry of the effective user), `%LOCALAPPDATA%\uuidv7\` on Windows. It holds
-  the counter file `sequence` and the daemon socket `uuidv7.sock`, and survives reboots.
-  Ordering is per user: different accounts keep separate counters. Caveats: a home
-  directory shared between machines (NFS) shares the file across them, and the static
-  musl `uuidv7z` has no NSS modules (it reads `/etc/passwd`, or nscd if one runs), so for
-  accounts that exist only in a directory service it finds no home and falls back to a
-  per-process counter.
+- Counter state lives in one per-user directory at a fixed path, never taken from
+  `TMPDIR`, `HOME` or `XDG_*`, so every shell, Nix dev shell, cron job and service of a
+  user shares it: `/tmp/uuidv7-<uid>/` on Linux and macOS (`<uid>` is the effective user
+  ID), `%LOCALAPPDATA%\Temp\uuidv7\` on Windows. It holds the counter file `sequence` and
+  the daemon socket `uuidv7.sock`. `/tmp` keeps the per-call writes in RAM where it is
+  tmpfs (common on Linux) or a RAM disk; on Windows the file is created with
+  `FILE_ATTRIBUTE_TEMPORARY` so the cache manager keeps it in memory. The state does not
+  survive a reboot; ordering across one relies on the clock. Because `/tmp` is shared,
+  the directory is created 0700 and used only if it is a real directory (not a symlink)
+  owned by the user with no group or other access; otherwise the CLI falls back to a
+  per-process counter and the daemon refuses to listen there. Ordering is per user:
+  different accounts keep separate counters. A service with a private `/tmp` (systemd
+  `PrivateTmp=`) sees a different directory.
 - `UUIDV7_STATE_DIR` — use this directory instead (tests, deliberate isolation).
 - `UUIDV7_SILENCE_INSECURE_RANDOM=1` — mute the red stderr warning that fires if no secure
   RNG (`getrandom`/`getentropy`/`/dev/urandom`) is available and it must fall back to the

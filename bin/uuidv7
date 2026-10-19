@@ -50,15 +50,15 @@ Arguments:
 
 State:
   Strict ordering across processes comes from a locked counter file in a
-  per-user directory found from the user account, not from TMPDIR or HOME:
-  ~/.local/state/uuidv7/sequence (Windows: %LOCALAPPDATA%\uuidv7\sequence).
+  per-user directory at a fixed path, not taken from TMPDIR or HOME:
+  /tmp/uuidv7-<uid>/sequence (Windows: %LOCALAPPDATA%\Temp\uuidv7\sequence).
   UUIDV7_STATE_DIR overrides the directory. The uuidv7z port shares it.
 
 Daemon:
   `uuidv7 --daemon` serves UUIDv7s over a Unix socket in that directory
-  (~/.local/state/uuidv7/uuidv7.sock). The plain CLI transparently uses a
+  (/tmp/uuidv7-<uid>/uuidv7.sock). The plain CLI transparently uses a
   running daemon for live generation. Send raw protocol lines to the socket, e.g.:
-    echo 'c5' | nc -U ~/.local/state/uuidv7/uuidv7.sock
+    echo 'c5' | nc -U "/tmp/uuidv7-$(id -u)/uuidv7.sock"
   Protocol (newline-terminated, no spaces; tokens in any order):
     <empty> one compact    c<N> N uuids    - hyphenated
     tn<ns> / tm<ms> explicit time    * ephemeral (requires tn/tm)

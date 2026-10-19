@@ -211,30 +211,37 @@ function MemoryCounter:get_next(current_nt, is_static, random_u64)
 end
 
 -- ===== per-user state directory =====
--- The counter file and the daemon socket live in one directory found from the OS
--- account, never from TMPDIR, HOME or XDG_* (those differ between shells, Nix dev
--- shells, cron and services, which would split the counter): the passwd home's
--- .local/state/uuidv7 on Linux and macOS, Local AppData\uuidv7 on Windows.
--- UUIDV7_STATE_DIR overrides it (tests, deliberate isolation).
+-- The counter file and the daemon socket live in one per-user directory at a fixed
+-- path, never taken from TMPDIR, HOME or XDG_* (those differ between shells, Nix
+-- dev shells, cron and services, which would split the counter): /tmp/uuidv7-<uid>
+-- on Linux and macOS (RAM-backed where /tmp is tmpfs or a RAM disk), and
+-- <Local AppData>\Temp\uuidv7 on Windows. UUIDV7_STATE_DIR overrides it (tests,
+-- deliberate isolation). On POSIX the directory is used only when it is a real
+-- directory owned by the effective user with no group or other access, because
+-- /tmp is shared and anyone could create the name first.
 if is_windows then
 	ffi.cdef[[
 		int SHGetFolderPathA(void *hwnd, int csidl, void *token, uint32_t flags, char *path);
 		int CreateDirectoryA(const char *path, void *sa);
 	]]
 else
-	if is_macos then
-		ffi.cdef[[ struct uuidv7_passwd { char *pw_name; char *pw_passwd; uint32_t pw_uid; uint32_t pw_gid;
-			long pw_change; char *pw_class; char *pw_gecos; char *pw_dir; char *pw_shell; long pw_expire; }; ]]
-	else
-		ffi.cdef[[ struct uuidv7_passwd { char *pw_name; char *pw_passwd; uint32_t pw_uid; uint32_t pw_gid;
-			char *pw_gecos; char *pw_dir; char *pw_shell; }; ]]
-	end
-	ffi.cdef[[ uint32_t geteuid(void); struct uuidv7_passwd *getpwuid(uint32_t uid); ]]
+	ffi.cdef[[
+		uint32_t geteuid(void);
+		int fstat(int fd, void *buf);
+		int openat(int dirfd, const char *pathname, int flags, ...);
+	]]
 end
 local CSIDL_LOCAL_APPDATA = 0x1c
 local STATE_DIR_MODE = 448   -- 0700
+local O_DIRECTORY = is_macos and 0x100000 or ((jit.arch == "arm64" or jit.arch == "arm") and 0x4000 or 0x10000)
+-- struct stat field offsets: st_mode (width), st_uid.
+local ST_MODE_OFF, ST_MODE_U16, ST_UID_OFF
+if is_macos then ST_MODE_OFF, ST_MODE_U16, ST_UID_OFF = 4, true, 16
+elseif jit.arch == "arm64" then ST_MODE_OFF, ST_MODE_U16, ST_UID_OFF = 16, false, 24
+else ST_MODE_OFF, ST_MODE_U16, ST_UID_OFF = 24, false, 28 end
+local S_IFMT, S_IFDIR = 0xF000, 0x4000
 
--- The state directory path (not created), or nil when the account has none.
+-- The state directory path (not created), or nil when none can be found.
 function M.state_dir()
 	local o = os.getenv("UUIDV7_STATE_DIR")
 	if o and o ~= "" then return (o:gsub("[/\\]+$", "")) end
@@ -242,18 +249,13 @@ function M.state_dir()
 		local buf = ffi.new("char[260]")
 		local ok, rc = pcall(function() return ffi.load("shell32").SHGetFolderPathA(nil, CSIDL_LOCAL_APPDATA, nil, 0, buf) end)
 		if not ok or rc ~= 0 then return nil end
-		return ffi.string(buf) .. "\\uuidv7"
+		return ffi.string(buf) .. "\\Temp\\uuidv7"
 	end
-	local pw = C.getpwuid(C.geteuid())
-	if pw == nil or pw.pw_dir == nil then return nil end
-	local home = ffi.string(pw.pw_dir):gsub("/+$", "")
-	if home == "" then return nil end
-	return home .. "/.local/state/uuidv7"
+	return "/tmp/uuidv7-" .. tostring(C.geteuid())
 end
 
--- Create the directory and any missing parents, private to the user (0700 on
--- POSIX; Windows directories under Local AppData inherit the user's ACL).
--- Existing directories are left as they are.
+-- Create the directory and any missing parents (0700 on POSIX; Windows
+-- directories inherit the per-user Local AppData ACL). Existing ones are kept.
 function M.ensure_dir(dir)
 	local prefix = ""
 	for part, sep in dir:gmatch("([^/\\]*)([/\\]?)") do
@@ -266,34 +268,44 @@ function M.ensure_dir(dir)
 	end
 end
 
+-- POSIX: create `dir` if needed and open it, or return nil unless it is a real
+-- directory (not a symlink) owned by the effective user with no group/other
+-- permissions. The returned fd anchors openat(), so the checked directory is the
+-- one used. Caller closes it.
+function M.open_private_dir(dir)
+	local function open_dir() return C.open(dir, bit.bor(O_DIRECTORY, O_NOFOLLOW), ffi.new("int", 0)) end
+	local fd = open_dir()
+	if fd < 0 then M.ensure_dir(dir); fd = open_dir() end
+	if fd < 0 then return nil end
+	local st = ffi.new("uint8_t[256]")
+	local ok = false
+	if C.fstat(fd, st) == 0 then
+		local mode = ST_MODE_U16 and ffi.cast("uint16_t*", st + ST_MODE_OFF)[0] or ffi.cast("uint32_t*", st + ST_MODE_OFF)[0]
+		local uid = ffi.cast("uint32_t*", st + ST_UID_OFF)[0]
+		ok = bit.band(mode, S_IFMT) == S_IFDIR and uid == C.geteuid() and bit.band(mode, 63) == 0
+	end
+	if not ok then C.close(fd); return nil end
+	return fd
+end
+
 -- Path of a file in the state directory, or nil.
 function M.state_file(name)
 	local dir = M.state_dir()
 	return dir and (dir .. "/" .. name)
 end
 
--- Open-or-create the state file; on a first failure create the directory and retry.
-local function open_state(path, open_once)
-	local h = open_once(path)
-	if h then return h end
-	local dir = path:match("^(.*)[/\\][^/\\]+$")
-	if dir and dir ~= "" then M.ensure_dir(dir) end
-	return open_once(path)
-end
-
 -- Filesystem (Linux and macOS CLI default): flock'd file in the state directory, atomic cross-process RMW.
 local FsCounter = {}
 FsCounter.__index = FsCounter
 function FsCounter:new()
-	return setmetatable({ filepath = M.state_file("sequence"), _nt = nil, _ctr = nil }, self)
+	return setmetatable({ dir = M.state_dir(), _nt = nil, _ctr = nil }, self)
 end
 function FsCounter:get_next(current_nt, is_static, random_u64)
 	local fd = -1
-	if self.filepath then
-		fd = open_state(self.filepath, function(p)
-			local f = C.open(p, bit.bor(O_CREAT, O_RDWR, O_NOFOLLOW), ffi.new("int", 384))   -- 0600
-			return f >= 0 and f or nil
-		end) or -1
+	local dfd = self.dir and M.open_private_dir(self.dir)
+	if dfd then
+		fd = C.openat(dfd, "sequence", bit.bor(O_CREAT, O_RDWR, O_NOFOLLOW), ffi.new("int", 384))   -- 0600
+		C.close(dfd)
 	end
 	if fd < 0 then
 		self._nt, self._ctr = advance(self._nt, self._ctr, current_nt, is_static, random_u64)
@@ -329,13 +341,17 @@ function WinCounter:new()
 end
 function WinCounter:get_next(current_nt, is_static, random_u64)
 	local GENERIC_RW, SHARE_RW, OPEN_ALWAYS, LOCKFILE_EXCLUSIVE = 0xC0000000, 3, 4, 2
+	-- FILE_ATTRIBUTE_TEMPORARY asks the cache manager to keep the file in memory.
+	local FILE_ATTRIBUTE_TEMPORARY = 0x100
+	local function open_file()
+		local r = C.CreateFileA(self.filepath, GENERIC_RW, SHARE_RW, nil, OPEN_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nil)
+		if ffi.cast("intptr_t", r) == -1 then return nil end
+		return r
+	end
 	local h = nil
 	if self.filepath then
-		h = open_state(self.filepath, function(p)
-			local r = C.CreateFileA(p, GENERIC_RW, SHARE_RW, nil, OPEN_ALWAYS, 0x80, nil)
-			if ffi.cast("intptr_t", r) == -1 then return nil end
-			return r
-		end)
+		h = open_file()
+		if not h then M.ensure_dir(M.state_dir()); h = open_file() end
 	end
 	if h == nil then
 		self._nt, self._ctr = advance(self._nt, self._ctr, current_nt, is_static, random_u64)
