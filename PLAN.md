@@ -14,8 +14,13 @@ Open work in priority order. Completed items: [docs/PLAN_LOG.md](docs/PLAN_LOG.m
 	- [x] Fix: state file written through a planted symlink (O_NOFOLLOW in both CLIs, tests/uuidv7_state_safety_test) (done 2026-10-14 19:21 EDT, 7746c5a)
 	- [x] Per-user state directory at a fixed RAM-backed path (/tmp/uuidv7-<uid>, verified 0700 and owned; Local AppData\Temp\uuidv7 with FILE_ATTRIBUTE_TEMPORARY on Windows), UUIDV7_STATE_DIR override; counter file and default socket both there (done 2026-10-19 19:58 EDT)
 	- [ ] Daemon clients refuse a socket owned by another user (SO_PEERCRED / getpeereid)
-	- [ ] Daemon state persistence covering crash/restart and concurrent file allocation: choose write-per-allocation vs durable reservation with BDFN
-- [ ] Plan cross-user machine-wide ordering (BDFN: later): system service, or a one-time admin-created group-owned 0660 state file (idea from the sibling os_counters project); bring a plan first
+	- [ ] Daemon persistence: write the per-user state file on every allocation (RAM) and seed from it at start; measure the cost (phase 1, context: docs/plan_context/system_service.md)
+- [ ] System service, layered default (BDFN 2026-10-19): plan written; awaiting review before code (context: docs/plan_context/system_service.md)
+	- [ ] Phase 2: client discovery order and system-socket trust check in uuidv7 and uuidv7z
+	- [ ] Phase 3: systemd socket activation, unit files, NixOS module
+	- [ ] Phase 4: launchd socket activation and plist (real-host sudo needs approval)
+	- [ ] Phase 5: Windows service host (install on the test host needs approval)
+	- [ ] Decide: system socket present but connection refused -> error or treat as absent
 
 ## Awaiting BDFN decisions (queued in the walking brief)
 - [x] Decision uuidv7-counter-scope: BDFN chose per user now, cross-user later (terminal answer, 2026-10-15 12:50 EDT)
