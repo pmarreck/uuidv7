@@ -20,6 +20,7 @@ annotate=[
 	test-windows = run the full ./test on a real Windows host over SSH (UUIDV7_WINDOWS_HOST)
 	tests/uuidv7_clock_test = injected-clock tests: monotonic+unique at 1ms/100ns/1ns ticks, backward steps, frozen clock, counter overflow
 	tests/uuidv7_concurrency_test = 24 concurrent local CLI processes at one ns: all unique, each stream strictly increasing
+	tests/uuidv7_daemon_persist_test = Daemon counter is the write-through per-user state file: seeds from it, shares it with uuidv7/uuidv7z, survives a hard kill
 	tests/uuidv7_differential_test = LuaJIT oracle vs Zig C ABI: encode, advance, extract, parse, round-trips, sorted sweep
 	tests/uuidv7_state_dir_test = Per-user state directory: override, 0700, TMPDIR ignored across both CLIs, default from the OS account
 	tests/uuidv7_state_safety_test = Both CLIs refuse a symlink planted at the counter state path (no overwrite, no create)

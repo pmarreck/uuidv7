@@ -17,3 +17,8 @@ Completed PLAN.md items retired by plan-retire, oldest retirement first.
 
 - [x] [Done (recent)] Mechatron Prime CI targets manifest + badge; README platform table (done 2026-10-06 18:10 EDT, 39bb636)
 - [x] [Done (recent)] wasm32-freestanding core compiles with all exports; ReleaseSmall 7,047 bytes (done 2026-10-06 18:10 EDT)
+
+## Retired 2026-10-21
+
+- [x] [Done (recent)] BDFN chose to fix the inherited CLI argument quirks (done 2026-10-06 23:08 EDT)
+- [x] [Done (recent)] Both CLIs: order-independent flags, last timestamp wins, unknown/extra arguments error, -- ends options, extract takes one UUID (done 2026-10-06 23:13 EDT, bede2d2)

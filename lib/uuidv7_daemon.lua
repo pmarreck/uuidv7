@@ -1,7 +1,9 @@
 -- uuidv7 daemon: a single-threaded, poll-based Unix-domain-socket server that
 -- dispenses UUIDv7 values (POSIX poll(2), or Winsock AF_UNIX + WSAPoll on Windows;
--- see uuidv7_net). Single process => the live counter is in-memory and the
--- cross-process monotonicity problem disappears. Zero deps (LuaJIT + FFI).
+-- see uuidv7_net). The live counter is the same locked per-user state file the
+-- standalone CLIs use (in RAM under /tmp), read and written on every allocation,
+-- so the daemon and file-based callers share one sequence and a crash or restart
+-- loses nothing. Zero deps (LuaJIT + FFI).
 
 local core = require("uuidv7_core")
 local json = require("uuidv7_json")
@@ -362,7 +364,7 @@ function M.run(opts)
 		sock_path = socket_path(),
 		exe = resolve_exe(opts.arg0 or (arg and arg[0])),
 		max_batch = tonumber(os.getenv("UUIDV7_MAX_BATCH")) or 1000,
-		counter = core.new_counter("memory"),
+		counter = core.new_counter("auto"),   -- write-through state file, shared with the CLIs
 		requests = 0, uuids_served = 0, last_batch = 0, peak_batch = 0,
 		k_same_ns = 0, k_rollback = 0, k_ts_ahead = 0, insecure_rng = 0,
 		conns_open = 0, conns_served = 0, retries = 0,

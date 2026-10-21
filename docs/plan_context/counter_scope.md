@@ -58,8 +58,9 @@ The two lookups differ, and both depend on environment variables.
 
 BDFN chose per user now, cross-user later (2026-10-15). Done: the per-user state
 directory below (both CLIs, daemon and clients; `tests/uuidv7_state_dir_test`).
-Open: the daemon owner check, daemon crash persistence, the unusable-file policy,
-and a plan for cross-user ordering.
+Done 2026-10-21: daemon crash persistence (the daemon counter is the write-through
+state file; `tests/uuidv7_daemon_persist_test`). Open: the daemon owner check and
+the unusable-file policy. Cross-user ordering is planned in `system_service.md`.
 
 ## Proposed fix
 

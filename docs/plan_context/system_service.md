@@ -17,7 +17,7 @@ and macOS lacks robust process-shared mutexes.
 | Socket | `/run/uuidv7/uuidv7.sock` | `/var/run/uuidv7/uuidv7.sock` | `%ProgramData%\uuidv7\uuidv7.sock` |
 | Activation | `uuidv7.socket` unit (`SocketMode=0666`), daemon adopts the fd via `LISTEN_FDS` | `LaunchDaemon` plist with a `Sockets` entry (`SockPathMode` 0666), daemon calls `launch_activate_socket` | a small C service host registered with the SCM that runs the daemon (LuaJIT cannot be an SCM service itself) |
 | Account | `DynamicUser=yes` | `nobody` | `LocalService` |
-| State across restarts | `/run/uuidv7/sequence`, `RuntimeDirectoryPreserve=yes` | `/var/run/uuidv7/sequence` | `%ProgramData%\uuidv7\sequence` |
+| State across restarts | `/run/uuidv7/sequence`, `RuntimeDirectoryPreserve=yes` | `/private/tmp/uuidv7-<service uid>/sequence` by default, configurable with `UUIDV7_STATE_DIR` in the plist | `%ProgramData%\uuidv7\sequence` |
 
 Any local user may request IDs (socket mode 0666). Allocation reveals nothing,
 so the only exposure is flooding, which the existing per-request caps bound.
@@ -40,19 +40,40 @@ those directories, so no other user can plant a socket there.
   same no-silent-fallback rule the per-user daemon has, because other processes
   are drawing from the service and a local value could sort out of order.
 - System socket present but the connection is refused (service crashed or
-  stopped and the socket file remained): **open question**. The choices are to
-  treat it as an error, which is strict, or as absent, which is available.
-  systemd and launchd normally remove or keep listening on the socket
-  themselves, so this mostly arises from a crash without socket activation.
+  stopped and the socket file remained): BDFN decided (2026-10-21) that the
+  service is restarted up to N times while each affected request fails with
+  "no service on this request, restarting; please try again", and after N
+  restarts the condition is treated as an error. Open detail: who restarts. An
+  unprivileged client cannot restart a system service on Linux or macOS, so the
+  proposal is that the service manager restarts it (systemd `Restart=always`
+  with `StartLimitBurst=N`, launchd `KeepAlive`, SCM recovery actions), and the
+  client counts consecutive refusals in its per-user state directory to switch
+  from the restarting message to the error. On Windows the service's DACL could
+  instead grant users `SERVICE_START`, so the client could start it itself.
+  systemd and launchd keep listening on an activated socket themselves, so this
+  mostly arises without socket activation.
 
 ## Durability
 
 The daemon writes its counter state to the service state file on every
-allocation, in RAM (`/run` is tmpfs; `/var/run` is on disk on a stock Mac,
-which the macOS row must note). This also answers the open daemon-persistence
-item for the per-user daemon: it writes `/tmp/uuidv7-<uid>/sequence` on every
-allocation and seeds from it at start, so daemon, CLI and uuidv7z share one
-state and crashes keep ordering. Measure the per-request cost before and after.
+request, in RAM. `/run` is tmpfs on Linux. On a stock Mac `/var/run` is on
+disk, so the macOS state file defaults to `/private/tmp`, which is a RAM disk on
+some setups and on disk on a stock Mac, where `UUIDV7_STATE_DIR` in the plist
+can point it at a RAM disk. The socket itself can stay in `/var/run/uuidv7/`, since
+a socket inode carries no data writes. A user who creates
+`/private/tmp/uuidv7-<service uid>` before the service starts makes the
+service refuse that directory (a denial of service, not a hijack); `/private/tmp`
+is cleared at boot.
+
+Done for the per-user daemon (phase 1, 2026-10-21): its counter is the per-user
+state file, taken under the lock once per request (a batch included), so
+daemon, `uuidv7` and `uuidv7z` share one sequence and a hard kill loses nothing
+(`tests/uuidv7_daemon_persist_test`). Measured on Linux x86_64, file on tmpfs,
+daemon and client pinned to separate cores, median of 5 runs: a single request
+went from 41.2 to 67.9 µs and a 1000-UUID batch from 3.03 to 3.44 µs per UUID.
+The extra cost is 12 syscalls per lock (directory open and check, file open,
+flock, read, ftruncate, write, close; strace counts). `pread`/`pwrite` and a
+fixed-width record could drop three of them if this matters later.
 
 ## Install
 

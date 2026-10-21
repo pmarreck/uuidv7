@@ -26,9 +26,10 @@ function M.execute(line)
 end
 
 -- Force-stop a process by the PID the daemon reports (a native Windows PID there).
-function M.kill(pid)
+-- hard sends SIGKILL, so no shutdown code runs (taskkill //F is always hard).
+function M.kill(pid, hard)
 	if is_windows then return M.execute("taskkill //F //PID " .. pid .. " >/dev/null 2>&1") end
-	return M.execute("kill " .. pid .. " 2>/dev/null")
+	return M.execute("kill " .. (hard and "-9 " or "") .. pid .. " 2>/dev/null")
 end
 
 function M.cleanup()

@@ -1,0 +1,113 @@
+#!/usr/bin/env luajit
+-- The daemon's counter lives in the per-user state file, not only in memory: it
+-- seeds from the file, writes every allocation through to it, shares it with the
+-- standalone CLIs while running, and keeps ordering across a hard kill. Counter
+-- values are made deterministic by seeding the file, so each check compares exact
+-- file contents instead of relying on random counter seeds.
+
+local self_dir = (arg and arg[0] or ""):match("^(.*)[/\\][^/\\]+$") or "."
+package.path = self_dir .. "/../lib/?.lua;" .. package.path
+local client = require("uuidv7_client")
+local core = require("uuidv7_core")
+local sh = dofile(self_dir .. "/uuidv7_testsh.lua")
+
+local tests, fails = 0, 0
+local function ok(name, cond, detail)
+	tests = tests + 1
+	if cond then
+		io.write("\u{2713} " .. name .. "\n")
+	else
+		io.stderr:write("\u{2717} " .. name .. (detail and (": " .. tostring(detail)) or "") .. "\n")
+		fails = fails + 1
+	end
+end
+
+local base = (os.getenv("TMPDIR") or os.getenv("TEMP") or "/tmp"):gsub("/+$", "")
+local run = base .. "/uuidv7_ptest_" .. tostring(os.time())
+local state = run .. "/state"
+sh.execute("mkdir -p '" .. state .. "' && chmod 700 '" .. state .. "'")
+local seqf = state .. "/sequence"
+local sock = run .. "/d.sock"
+local exe = self_dir .. "/../bin/uuidv7"
+local libp = self_dir .. "/../lib/?.lua;;"
+local env = string.format("env UUIDV7_STATE_DIR=%q UUIDV7_SOCK=%q UUIDV7_LOG=%q LUA_PATH=%q UUIDV7_SILENCE_INSECURE_RANDOM=1",
+	state, sock, run .. "/d.log", libp)
+
+local NT = "1645557742000524287"
+local function write_seq(s) local f = assert(io.open(seqf, "wb")); f:write(s); f:close() end
+local function read_seq() local f = io.open(seqf, "rb"); if not f then return nil end; local s = f:read("*a"); f:close(); return s end
+
+local dh
+local function start_daemon()
+	dh = sh.popen(env .. " " .. string.format("%q", exe) .. " --daemon 2>" .. string.format("%q", run .. "/derr"), "r")
+	while true do
+		local l = dh:read("*l")
+		if not l then return false end
+		if l:match("^UUIDV7%-LISTENING") then return true end
+	end
+end
+local function req(line) return ((client.oneshot(sock, line)) or ""):gsub("%s+$", "") end
+local function cli(prog, args)
+	local h = sh.popen(env .. " UUIDV7_NO_DAEMON=1 " .. string.format("%q", prog) .. " " .. args .. " 2>/dev/null", "r")
+	local out = (h:read("*a") or ""):gsub("%s+$", ""); h:close()
+	return out
+end
+
+local pid, stopped
+local function body()
+	write_seq(NT .. ":1000")
+	ok("daemon starts", start_daemon())
+	pid = req("sj"):match('"pid":(%d+)')
+
+	local u1 = req("tn" .. NT)
+	ok("daemon seeds its counter from the state file", read_seq() == NT .. ":1001", read_seq())
+
+	local c1 = cli(exe, NT)
+	ok("standalone uuidv7 continues the daemon's counter", read_seq() == NT .. ":1002" and c1 > u1, c1 .. " vs " .. u1)
+	local u2 = req("tn" .. NT)
+	ok("daemon continues the standalone counter", read_seq() == NT .. ":1003" and u2 > c1, u2 .. " vs " .. c1)
+	local b = {}; for l in req("c3tn" .. NT):gmatch("[^\n]+") do b[#b + 1] = l end
+	ok("a batch writes its last counter through", read_seq() == NT .. ":1006" and #b == 3 and b[1] > u2 and b[3] > b[2] and b[2] > b[1], read_seq())
+	u2 = b[3]
+
+	local zexe = os.getenv("UUIDV7Z")
+	if zexe and zexe ~= "" then
+		local z1 = cli(zexe, NT)
+		ok("standalone uuidv7z continues the daemon's counter", read_seq() == NT .. ":1007" and z1 > u2, z1 .. " vs " .. u2)
+		u2 = z1
+	end
+	local last = read_seq()
+
+	-- Hard kill: no shutdown path runs, so only state already written survives.
+	sh.kill(pid, true)
+	dh:close(); dh = nil
+	ok("state survives a hard kill", read_seq() == last, read_seq())
+	ok("daemon restarts after a hard kill", start_daemon())
+	pid = req("sj"):match('"pid":(%d+)')
+	local n = tonumber(last:match(":(%d+)$"))
+	local u3 = req("tn" .. NT)
+	ok("restarted daemon continues after the crash", read_seq() == NT .. ":" .. (n + 1) and u3 > u2, u3 .. " vs " .. u2)
+
+	-- Live requests use the file too: a stored time ahead of the clock (as after a
+	-- clock step back) freezes at that time and increments.
+	local ahead = core.get_nanotime() + 600000000000LL
+	local ahead_s = tostring(ahead):gsub("LL$", "")
+	write_seq(ahead_s .. ":5")
+	local live = req("")
+	local ms_hex = string.format("%012x", tonumber(ahead / 1000000LL))
+	ok("live request freezes at the stored time ahead of the clock", live:sub(1, 12) == ms_hex, live .. " vs " .. ms_hex)
+	ok("live request writes through", read_seq() == ahead_s .. ":6", read_seq())
+
+	local shut = req("+++") == "OK"
+	ok("+++ -> OK", shut)
+	if shut then dh:read("*a"); stopped = true end
+end
+
+local okrun, err = pcall(body)
+if pid and not stopped then sh.kill(pid, true) end
+if dh then pcall(function() dh:close() end) end
+sh.execute("rm -rf '" .. run .. "' 2>/dev/null")
+sh.cleanup()
+if not okrun then io.stderr:write("daemon persistence test crashed: " .. tostring(err) .. "\n"); os.exit(1) end
+if fails > 0 then io.stderr:write(fails .. " of " .. tests .. " daemon persistence tests failed!\n"); os.exit(1) end
+io.write("All " .. tests .. " daemon persistence tests passed!\n")

@@ -300,46 +300,54 @@ FsCounter.__index = FsCounter
 function FsCounter:new()
 	return setmetatable({ dir = M.state_dir(), _nt = nil, _ctr = nil }, self)
 end
-function FsCounter:get_next(current_nt, is_static, random_u64)
+-- Parse the "ns:counter" state text into (int64, uint64), or nil for empty/garbled.
+local function parse_state(s)
+	local s_nt, s_ctr = s:match("(%-?%d+):(%d+)")
+	if not (s_nt and s_ctr) then return nil end
+	return strtoll(s_nt, nil, 10), ffi.cast("uint64_t", strtoll(s_ctr, nil, 10))
+end
+
+-- Run fn(mem) under the file lock, where mem is a MemoryCounter seeded from the
+-- stored state; the state mem ends in is written back once before unlocking. One
+-- locked read-modify-write then covers a whole batch. Without a usable file, fn
+-- runs against this process's own state.
+function FsCounter:locked(fn)
 	local fd = -1
 	local dfd = self.dir and M.open_private_dir(self.dir)
 	if dfd then
 		fd = C.openat(dfd, "sequence", bit.bor(O_CREAT, O_RDWR, O_NOFOLLOW), ffi.new("int", 384))   -- 0600
 		C.close(dfd)
 	end
+	local mem = MemoryCounter:new()
 	if fd < 0 then
-		self._nt, self._ctr = advance(self._nt, self._ctr, current_nt, is_static, random_u64)
-		return self._nt, self._ctr, "new"
+		mem._nt, mem._ctr = self._nt, self._ctr
+		local r = { fn(mem) }
+		self._nt, self._ctr = mem._nt, mem._ctr
+		return unpack(r)
 	end
 	C.flock(fd, C.LOCK_EX)
 	C.lseek(fd, 0, C.SEEK_SET)
 	local buf = ffi.new("char[?]", 96)
 	local n = C.read(fd, buf, 95)
-	local stored_nt, stored_ctr
-	if n > 0 then
-		local s_nt, s_ctr = ffi.string(buf, n):match("(%-?%d+):(%d+)")
-		if s_nt and s_ctr then
-			stored_nt = strtoll(s_nt, nil, 10)
-			stored_ctr = ffi.cast("uint64_t", strtoll(s_ctr, nil, 10))
-		end
+	if n > 0 then mem._nt, mem._ctr = parse_state(ffi.string(buf, n)) end
+	local r = { fn(mem) }
+	if mem._nt ~= nil then
+		local out = num_to_dec(mem._nt) .. ":" .. num_to_dec(mem._ctr)
+		C.lseek(fd, 0, C.SEEK_SET)
+		C.ftruncate(fd, 0)
+		C.write(fd, out, #out)
 	end
-	local eff, ctr, kind = advance(stored_nt, stored_ctr, current_nt, is_static, random_u64)
-	local out = num_to_dec(eff) .. ":" .. num_to_dec(ctr)
-	C.lseek(fd, 0, C.SEEK_SET)
-	C.ftruncate(fd, 0)
-	C.write(fd, out, #out)
 	C.flock(fd, C.LOCK_UN)
 	C.close(fd)
-	return eff, ctr, kind
+	return unpack(r)
 end
-
 -- Windows: a LockFileEx-locked state file, same "ns:counter" text format as FsCounter.
 local WinCounter = {}
 WinCounter.__index = WinCounter
 function WinCounter:new()
 	return setmetatable({ filepath = M.state_file("sequence"), _nt = nil, _ctr = nil }, self)
 end
-function WinCounter:get_next(current_nt, is_static, random_u64)
+function WinCounter:locked(fn)
 	local GENERIC_RW, SHARE_RW, OPEN_ALWAYS, LOCKFILE_EXCLUSIVE = 0xC0000000, 3, 4, 2
 	-- FILE_ATTRIBUTE_TEMPORARY asks the cache manager to keep the file in memory.
 	local FILE_ATTRIBUTE_TEMPORARY = 0x100
@@ -353,33 +361,39 @@ function WinCounter:get_next(current_nt, is_static, random_u64)
 		h = open_file()
 		if not h then M.ensure_dir(M.state_dir()); h = open_file() end
 	end
+	local mem = MemoryCounter:new()
 	if h == nil then
-		self._nt, self._ctr = advance(self._nt, self._ctr, current_nt, is_static, random_u64)
-		return self._nt, self._ctr, "new"
+		mem._nt, mem._ctr = self._nt, self._ctr
+		local r = { fn(mem) }
+		self._nt, self._ctr = mem._nt, mem._ctr
+		return unpack(r)
 	end
 	local ov = ffi.new("uuidv7_OVERLAPPED")
 	C.LockFileEx(h, LOCKFILE_EXCLUSIVE, 0, 0xFFFFFFFF, 0xFFFFFFFF, ov)
 	local buf = ffi.new("char[?]", 96)
 	local got = ffi.new("uint32_t[1]")
 	C.SetFilePointer(h, 0, nil, 0)
-	local stored_nt, stored_ctr
 	if C.ReadFile(h, buf, 95, got, nil) ~= 0 and got[0] > 0 then
-		local s_nt, s_ctr = ffi.string(buf, got[0]):match("(%-?%d+):(%d+)")
-		if s_nt and s_ctr then
-			stored_nt = strtoll(s_nt, nil, 10)
-			stored_ctr = ffi.cast("uint64_t", strtoll(s_ctr, nil, 10))
-		end
+		mem._nt, mem._ctr = parse_state(ffi.string(buf, got[0]))
 	end
-	local eff, ctr, kind = advance(stored_nt, stored_ctr, current_nt, is_static, random_u64)
-	local out = num_to_dec(eff) .. ":" .. num_to_dec(ctr)
-	C.SetFilePointer(h, 0, nil, 0)
-	C.WriteFile(h, out, #out, got, nil)
-	C.SetEndOfFile(h)
+	local r = { fn(mem) }
+	if mem._nt ~= nil then
+		local out = num_to_dec(mem._nt) .. ":" .. num_to_dec(mem._ctr)
+		C.SetFilePointer(h, 0, nil, 0)
+		C.WriteFile(h, out, #out, got, nil)
+		C.SetEndOfFile(h)
+	end
 	C.UnlockFileEx(h, 0, 0xFFFFFFFF, 0xFFFFFFFF, ov)
 	C.CloseHandle(h)
-	return eff, ctr, kind
+	return unpack(r)
 end
 
+-- File-backed counters: one value is a batch of one.
+local function locked_get_next(self, current_nt, is_static, random_u64)
+	return self:locked(function(mem) return mem:get_next(current_nt, is_static, random_u64) end)
+end
+FsCounter.get_next, WinCounter.get_next = locked_get_next, locked_get_next
+MemoryCounter.locked = function(self, fn) return fn(self) end
 function M.new_counter(backend)
 	if backend == "auto" or backend == nil then
 		backend = is_windows and "win" or "fs"
@@ -502,11 +516,13 @@ function M.generate(counter, opts)
 	local count = opts.count or 1
 	local lines = {}
 	local kinds = { new = 0, same_ns = 0, rollback = 0, ts_ahead = 0 }
-	for i = 1, count do
-		local b, kind = generate_bytes(counter, opts.time)
-		lines[i] = format_uuid(b, opts.hyphens)
-		kinds[kind] = (kinds[kind] or 0) + 1
-	end
+	counter:locked(function(c)
+		for i = 1, count do
+			local b, kind = generate_bytes(c, opts.time)
+			lines[i] = format_uuid(b, opts.hyphens)
+			kinds[kind] = (kinds[kind] or 0) + 1
+		end
+	end)
 	return lines, kinds
 end
 

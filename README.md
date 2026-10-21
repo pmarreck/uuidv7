@@ -143,13 +143,17 @@ no file mode or peer-credential call for these sockets, so the log records no pe
 Restart (`r`) hands the open listener to a new process instead of re-executing in place,
 so the PID changes. Ctrl-C ends the daemon immediately rather than running its shutdown
 logging, and the next start replaces the stale socket file. All OS-specific calls live in
-`lib/uuidv7_net.lua`. Because it's one process, the
-counter is in-memory and strictly monotonic with no cross-process coordination at all.
+`lib/uuidv7_net.lua`. The daemon's counter is the same locked per-user state file the
+standalone CLIs use: each request takes the lock once (a batch included), reads the state,
+and writes the new state back before replying. Daemon and standalone calls therefore share
+one sequence, and a crash or hard kill loses nothing. Measured on Linux with the file on
+tmpfs, this raised a single request from 41 to 68&nbsp;µs and a 1000-UUID batch from 3.0 to
+3.4&nbsp;µs per UUID, against an in-memory counter.
 The plain `uuidv7` CLI **transparently uses the daemon** for live generation when its
 socket is reachable (no auto-spawn). When a daemon *is* reachable it is authoritative: the
-CLI gets the UUID from it and **never silently generates locally** — local generation uses
-the separate locked-file counter, so a silent fallback could emit a UUID that sorts out of
-order against the daemon's in-memory stream, breaking strict monotonicity. If the daemon
+CLI gets the UUID from it and **never silently generates locally**: a daemon that answers
+but will not serve is a fault to report, and a daemon whose state the CLI cannot reach (the
+planned system service keeps its own) would otherwise get values that sort out of order. If the daemon
 momentarily won't serve, the CLI retries with tiny exponential backoff (50&nbsp;µs base,
 ~1.5× with jitter), tagging each retry with `R<attempt>`/`W<µs-waited>` tokens the daemon
 logs, then **errors** once the attempt cap (`UUIDV7_DAEMON_RETRIES`, default 20) or the
