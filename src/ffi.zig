@@ -147,6 +147,15 @@ export fn uuidv7_retry_attempts(no_retry: ?[*]const u8, no_retry_len: usize, ret
 	return OK;
 }
 
+export fn uuidv7_service_refusal(prior: ?[*]const u8, prior_len: usize, count: ?*u32, action: ?*u8) c_int {
+	const c = count orelse return ERR_NULL;
+	const a = action orelse return ERR_NULL;
+	const r = core.serviceRefusal(input(prior, prior_len) orelse return ERR_NULL);
+	c.* = r.count;
+	a.* = switch (r.action) { .try_again => 0, .give_up => 1 };
+	return OK;
+}
+
 export fn uuidv7_retry_timeout_us(text: ?[*]const u8, text_len: usize, out: ?*u64) c_int {
 	const o = out orelse return ERR_NULL;
 	o.* = core.retryTimeoutUs(input(text, text_len) orelse return ERR_NULL);

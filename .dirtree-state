@@ -25,6 +25,7 @@ annotate=[
 	tests/uuidv7_state_dir_test = Per-user state directory: override, 0700, TMPDIR ignored across both CLIs, default from the OS account
 	tests/uuidv7_state_safety_test = Both CLIs refuse a symlink planted at the counter state path (no overwrite, no create)
 	tests/uuidv7_stub_daemon.lua = Stub UDS daemon: fixed reply to every request, records request lines, stops on STOP
+	tests/uuidv7_system_socket_test = System service discovery (UUIDV7_SOCK > trusted system socket > per-user daemon > file), trust classifier, refused-service exit 75/1 policy, both CLIs
 	tests/uuidv7_testsh.lua = Test helper: runs POSIX shell lines on every OS (via Git Bash scripts on Windows); popen/execute/kill/cleanup
 	tests/uuidv7_windows_test = Windows-only CLI contract: daemon refusal, secure RNG, LockFileEx counter ordering across processes
 	tests/uuidv7z_cli_test = CLI differential: uuidv7z vs LuaJIT uuidv7 (exit codes, stdout, stderr, ordering)

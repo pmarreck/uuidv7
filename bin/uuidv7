@@ -67,8 +67,14 @@ Daemon:
   When a daemon is reachable the CLI gets its UUID from it and NEVER silently
   generates locally (that uses a separate counter and could break monotonicity):
   it retries with tiny exponential backoff, then errors. Tune/disable via env.
-  Env: UUIDV7_STATE_DIR, UUIDV7_SOCK, UUIDV7_MAX_BATCH(=1000), UUIDV7_SILENCE_INSECURE_RANDOM,
-       UUIDV7_LOG / XDG_STATE_HOME (JSONL log location), UUIDV7_NS_EXTRACT_OK,
+  Socket order: UUIDV7_SOCK; an installed system service (/run/uuidv7/uuidv7.sock,
+  macOS /var/run/uuidv7/uuidv7.sock, Windows %ProgramData%\uuidv7\uuidv7.sock;
+  UUIDV7_SYSTEM_SOCK overrides) when its directory only root or you can write;
+  then the per-user daemon. If the system socket refuses connections, the first
+  3 requests in a row exit 75 ("please try again") while it restarts, then 1.
+  Env: UUIDV7_STATE_DIR, UUIDV7_SOCK, UUIDV7_SYSTEM_SOCK, UUIDV7_MAX_BATCH(=1000),
+       UUIDV7_SILENCE_INSECURE_RANDOM, UUIDV7_NS_EXTRACT_OK,
+       UUIDV7_LOG / XDG_STATE_HOME (JSONL log location),
        UUIDV7_DAEMON_RETRIES(=20), UUIDV7_DAEMON_RETRY_TIMEOUT_US(=2000),
        UUIDV7_DAEMON_NO_RETRY (error instead of retry).
 

@@ -25,6 +25,7 @@
 #include <windows.h>
 #include <bcrypt.h>
 #include <shlobj.h>
+#include <aclapi.h>
 #include <fcntl.h>
 #include <io.h>
 #include <wchar.h>
@@ -307,17 +308,78 @@ typedef int sock_t;
 #endif
 #define DAEMON_REPLY_MAX 4096
 
-/* The daemon's socket: $UUIDV7_SOCK, else uuidv7.sock in the state directory,
- * the same lookup as the LuaJIT client and daemon. On POSIX a state directory
- * that is not private to this user gives NULL (no daemon), so a socket planted
- * by someone else is never used. Caller frees. */
-static char *daemon_socket_path(void) {
-	const char *sock = getenv("UUIDV7_SOCK");
-	if (sock) {
-		char *p = malloc(strlen(sock) + 1);
-		if (!p) die(PROG ": out of memory\n");
-		return strcpy(p, sock);
-	}
+/* ---- small text files in the private state directory ---- */
+
+/* Read up to cap-1 bytes of state-directory file `name` into buf (NUL-terminated).
+ * Returns the length, or -1 when absent, unreadable or the directory is not private. */
+static long read_state_text(const char *name, char *buf, size_t cap) {
+	char *dir = state_dir();
+	if (!dir) return -1;
+	long n = -1;
+#ifdef _WIN32
+	char path[MAX_STATE_PATH];
+	snprintf(path, sizeof path, "%s\\%s", dir, name);
+	free(dir);
+	FILE *f = fopen(path, "rb");
+	if (!f) return -1;
+	n = (long)fread(buf, 1, cap - 1, f);
+	fclose(f);
+#else
+	int dfd = open_private_dir(dir);
+	free(dir);
+	if (dfd < 0) return -1;
+	int fd = openat(dfd, name, O_RDONLY | O_NOFOLLOW);
+	close(dfd);
+	if (fd < 0) return -1;
+	ssize_t r = read(fd, buf, cap - 1);
+	close(fd);
+	if (r < 0) return -1;
+	n = (long)r;
+#endif
+	buf[n] = 0;
+	return n;
+}
+
+/* Replace state-directory file `name` with `text`. Failure is ignored: the
+ * refusal count it holds is advisory. */
+static void write_state_text(const char *name, const char *text) {
+	char *dir = state_dir();
+	if (!dir) return;
+	size_t len = strlen(text);
+#ifdef _WIN32
+	char path[MAX_STATE_PATH];
+	ensure_dir(dir);
+	snprintf(path, sizeof path, "%s\\%s", dir, name);
+	free(dir);
+	FILE *f = fopen(path, "wb");
+	if (!f) return;
+	fwrite(text, 1, len, f);
+	fclose(f);
+#else
+	int dfd = open_private_dir(dir);
+	free(dir);
+	if (dfd < 0) return;
+	int fd = openat(dfd, name, O_CREAT | O_RDWR | O_NOFOLLOW, 0600);
+	close(dfd);
+	if (fd < 0) return;
+	if (ftruncate(fd, 0) != 0 || write(fd, text, len) != (ssize_t)len) { /* advisory */ }
+	close(fd);
+#endif
+}
+
+/* ---- daemon discovery ---- */
+
+static char *dup_str(const char *s) {
+	char *p = malloc(strlen(s) + 1);
+	if (!p) die(PROG ": out of memory\n");
+	return strcpy(p, s);
+}
+
+/* The per-user daemon socket: uuidv7.sock in the state directory, the same
+ * lookup as the LuaJIT client and daemon. On POSIX a state directory that is
+ * not private to this user gives NULL (no daemon), so a socket planted by
+ * someone else is never used. Caller frees. */
+static char *user_socket_path(void) {
 	char *dir = state_dir();
 	if (!dir) return NULL;
 #ifndef _WIN32
@@ -330,6 +392,147 @@ static char *daemon_socket_path(void) {
 	if (!p) die(PROG ": out of memory\n");
 	strcpy(p + dl, "/uuidv7.sock");
 	return p;
+}
+
+/* The installed system service's socket: $UUIDV7_SYSTEM_SOCK, else
+ * /run/uuidv7/uuidv7.sock (Linux), /var/run/uuidv7/uuidv7.sock (macOS) or
+ * %ProgramData%\uuidv7\uuidv7.sock (Windows). NULL if there is none. Caller frees. */
+static char *system_socket_path(void) {
+	const char *o = getenv("UUIDV7_SYSTEM_SOCK");
+	if (o && *o) return dup_str(o);
+#ifdef _WIN32
+	char pd[MAX_PATH], buf[MAX_STATE_PATH];
+	if (SHGetFolderPathA(NULL, CSIDL_COMMON_APPDATA, NULL, 0, pd) != S_OK) return NULL;
+	snprintf(buf, sizeof buf, "%s\\uuidv7\\uuidv7.sock", pd);
+	return dup_str(buf);
+#elif defined(__APPLE__)
+	return dup_str("/var/run/uuidv7/uuidv7.sock");
+#else
+	return dup_str("/run/uuidv7/uuidv7.sock");
+#endif
+}
+
+static int path_exists(const char *path) {
+#ifdef _WIN32
+	return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+#else
+	return access(path, F_OK) == 0;
+#endif
+}
+
+#ifdef _WIN32
+/* Owned by LocalSystem, LocalService, NetworkService, Administrators or the
+ * current user (the owner SID from GetNamedSecurityInfo)? */
+static int win_trusted_owner(const char *path) {
+	PSID owner = NULL;
+	PSECURITY_DESCRIPTOR sd = NULL;
+	if (GetNamedSecurityInfoA(path, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &owner, NULL, NULL, NULL, &sd) != ERROR_SUCCESS)
+		return 0;
+	int trusted = IsWellKnownSid(owner, WinLocalSystemSid) || IsWellKnownSid(owner, WinLocalServiceSid) ||
+		IsWellKnownSid(owner, WinNetworkServiceSid) || IsWellKnownSid(owner, WinBuiltinAdministratorsSid);
+	HANDLE tok;
+	if (!trusted && OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+		union { TOKEN_USER user; unsigned char raw[256]; } info;
+		DWORD got = 0;
+		if (GetTokenInformation(tok, TokenUser, &info, sizeof info, &got)) trusted = EqualSid(owner, info.user.User.Sid);
+		CloseHandle(tok);
+	}
+	LocalFree(sd);
+	return trusted;
+}
+#endif
+
+/* Whether a system socket at `path` can only have been placed by an
+ * administrator, the service or this user; the same rule as core.trusted_socket
+ * in the LuaJIT CLI. POSIX: its directory is a real directory (not a symlink)
+ * owned by root or this user that group and other cannot write. Windows: the
+ * directory and the socket file are owned by a system account, Administrators
+ * or this user. On failure `why` says why. */
+static int trusted_socket(const char *path, char *why, size_t why_cap) {
+	char dir[MAX_STATE_PATH];
+	const char *slash = strrchr(path, '/');
+#ifdef _WIN32
+	const char *bs = strrchr(path, '\\');
+	if (!slash || (bs && bs > slash)) slash = bs;
+#endif
+	size_t dl = slash ? (size_t)(slash - path) : 0;
+	if (dl == 0 || dl >= sizeof dir) { snprintf(why, why_cap, "it has no directory"); return 0; }
+	memcpy(dir, path, dl);
+	dir[dl] = 0;
+#ifdef _WIN32
+	if (!win_trusted_owner(dir)) {
+		snprintf(why, why_cap, "its directory %s is not owned by an administrator, a system account or this user", dir);
+		return 0;
+	}
+	if (!win_trusted_owner(path)) {
+		snprintf(why, why_cap, "it is not owned by an administrator, a system account or this user");
+		return 0;
+	}
+	return 1;
+#else
+	int fd = open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+	if (fd < 0) { snprintf(why, why_cap, "its directory %s is not a real directory", dir); return 0; }
+	struct stat st;
+	int ok = fstat(fd, &st) == 0 && S_ISDIR(st.st_mode) && (st.st_uid == 0 || st.st_uid == geteuid()) &&
+		(st.st_mode & 022) == 0;
+	close(fd);
+	if (!ok) snprintf(why, why_cap, "its directory %s is not owned by root or this user, or group or other can write it", dir);
+	return ok;
+#endif
+}
+
+enum sock_kind { SOCK_ENV, SOCK_SYSTEM, SOCK_USER };
+
+/* Which daemon socket to use, in discovery order: $UUIDV7_SOCK; the system
+ * service's socket when its file exists and it is trusted; else the per-user
+ * daemon socket. Warns on stderr about a system socket it ignores. NULL when
+ * there is none. Caller frees. */
+static char *resolve_socket(enum sock_kind *kind) {
+	const char *env = getenv("UUIDV7_SOCK");
+	if (env) { *kind = SOCK_ENV; return dup_str(env); }
+	char *sys = system_socket_path();
+	if (sys && path_exists(sys)) {
+		char why[MAX_STATE_PATH + 128];
+		if (trusted_socket(sys, why, sizeof why)) { *kind = SOCK_SYSTEM; return sys; }
+		fprintf(stderr, PROG ": ignoring the system socket at %s: %s\n", sys, why);
+	}
+	free(sys);
+	*kind = SOCK_USER;
+	return user_socket_path();
+}
+
+#define REFUSALS_FILE "service_refusals"
+#define EXIT_TEMPFAIL 75   /* sysexits EX_TEMPFAIL: try again later */
+
+/* A trusted system socket file refused the connection: the service crashed and
+ * its manager is restarting it. Count the refusal and exit; never generate
+ * locally or use the per-user daemon, since other processes draw from the service. */
+static _Noreturn void service_refused(const char *path) {
+	char prior[32];
+	long n = read_state_text(REFUSALS_FILE, prior, sizeof prior);
+	uint32_t count;
+	uint8_t action;
+	if (uuidv7_service_refusal(prior, n > 0 ? (size_t)n : 0, &count, &action) != UUIDV7_OK)
+		die(PROG ": internal error in the service refusal policy\n");
+	char text[16];
+	snprintf(text, sizeof text, "%lu", (unsigned long)count);
+	write_state_text(REFUSALS_FILE, text);
+	if (action == UUIDV7_SERVICE_TRY_AGAIN) {
+		fprintf(stderr, PROG ": no service on this request, restarting; please try again (the system service at %s "
+			"refused the connection; refusal %lu of %d)\n", path, (unsigned long)count, UUIDV7_SERVICE_RESTARTS);
+		exit(EXIT_TEMPFAIL);
+	}
+	fprintf(stderr, PROG ": the system service at %s is not running: it refused %lu requests in a row, more than "
+		"the %d restarts allowed. Have an administrator restart or uninstall it.\n",
+		path, (unsigned long)count, UUIDV7_SERVICE_RESTARTS);
+	exit(1);
+}
+
+/* The system service accepted a connection: clear a nonzero refusal count. */
+static void service_reachable(void) {
+	char prior[32];
+	long n = read_state_text(REFUSALS_FILE, prior, sizeof prior);
+	if (n > 0 && strcmp(prior, "0") != 0) write_state_text(REFUSALS_FILE, "0");
 }
 
 /* One request on a fresh connection: send `line` plus a newline, half-close,
@@ -413,7 +616,8 @@ static size_t env_text(const char *name, const char **out) {
  * daemon's stream, so this exits 1 instead of falling back. */
 static int try_daemon(int hyphens) {
 	if (getenv("UUIDV7_NO_DAEMON")) return 0;
-	char *path = daemon_socket_path();
+	enum sock_kind kind;
+	char *path = resolve_socket(&kind);
 	if (!path) return 0;
 #ifdef _WIN32
 	WSADATA wsa;
@@ -435,7 +639,12 @@ static int try_daemon(int hyphens) {
 	for (;;) {
 		if (uuidv7_retry_request(&r, hyphens, line, sizeof line, &line_len) != UUIDV7_OK)
 			die(PROG ": internal error building a daemon request\n");
-		if (!daemon_oneshot(path, line, line_len, reply, sizeof reply, &reply_len)) { free(path); return 0; }
+		if (!daemon_oneshot(path, line, line_len, reply, sizeof reply, &reply_len)) {
+			if (kind == SOCK_SYSTEM) service_refused(path);
+			free(path);
+			return 0;
+		}
+		if (kind == SOCK_SYSTEM && r.attempt == 1) service_reachable();
 		if (uuidv7_reply_served(reply, reply_len) == 1) {
 			free(path);
 			fwrite(reply, 1, reply_len, stdout);
@@ -519,9 +728,14 @@ static void show_help(void) {
 		"timestamps stay local. If a reachable daemon will not serve, uuidv7z retries it\n"
 		"and then exits 1 rather than generating locally. Only the LuaJIT `uuidv7` runs\n"
 		"the daemon (--daemon, --api).\n"
-		"Env: UUIDV7_STATE_DIR, UUIDV7_SOCK, UUIDV7_NO_DAEMON, UUIDV7_DAEMON_RETRIES,\n"
-		"  UUIDV7_DAEMON_RETRY_TIMEOUT_US, UUIDV7_DAEMON_NO_RETRY, UUIDV7_NS_EXTRACT_OK,\n"
-		"  UUIDV7_SILENCE_INSECURE_RANDOM.\n"
+		"Socket order: UUIDV7_SOCK; an installed system service (/run/uuidv7/uuidv7.sock,\n"
+		"macOS /var/run/uuidv7/uuidv7.sock, Windows %ProgramData%\\uuidv7\\uuidv7.sock;\n"
+		"UUIDV7_SYSTEM_SOCK overrides) when its directory only root or you can write;\n"
+		"then the per-user daemon. If the system socket refuses connections, the first\n"
+		"3 requests in a row exit 75 (\"please try again\") while it restarts, then 1.\n"
+		"Env: UUIDV7_STATE_DIR, UUIDV7_SOCK, UUIDV7_SYSTEM_SOCK, UUIDV7_NO_DAEMON,\n"
+		"  UUIDV7_DAEMON_RETRIES, UUIDV7_DAEMON_RETRY_TIMEOUT_US, UUIDV7_DAEMON_NO_RETRY,\n"
+		"  UUIDV7_NS_EXTRACT_OK, UUIDV7_SILENCE_INSECURE_RANDOM.\n"
 		"\n"
 		"Examples:\n"
 		"  uuidv7z                      Generate UUID without hyphens\n"

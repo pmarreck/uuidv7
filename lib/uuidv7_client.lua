@@ -7,11 +7,10 @@ local net = require("uuidv7_net")     -- sockets + sleep, POSIX or Winsock
 
 local M = {}
 
--- $UUIDV7_SOCK, else uuidv7.sock in the per-user state directory (see
+-- The per-user daemon socket: uuidv7.sock in the per-user state directory (see
 -- core.state_dir). On POSIX a state directory that is not private to this user
 -- yields "" (no daemon), so a socket planted by someone else is never used.
-local function default_path()
-	if os.getenv("UUIDV7_SOCK") then return os.getenv("UUIDV7_SOCK") end
+local function user_path()
 	local dir = core.state_dir()
 	if not dir then return "" end
 	if not net.is_windows then
@@ -21,6 +20,24 @@ local function default_path()
 	end
 	return dir .. "/uuidv7.sock"
 end
+
+-- Which daemon socket to use, in discovery order: $UUIDV7_SOCK ("env"); the
+-- installed system service's socket when its file exists and it is trusted
+-- (core.trusted_socket) ("system"); else the per-user daemon socket ("user").
+-- Returns path, kind and, for a system socket that exists but is not trusted,
+-- a warning saying why it is ignored.
+function M.resolve_socket()
+	local env = os.getenv("UUIDV7_SOCK")
+	if env then return env, "env" end
+	local sys, warning = core.system_socket_path(), nil
+	if sys and core.path_exists(sys) then
+		local trusted, why = core.trusted_socket(sys)
+		if trusted then return sys, "system" end
+		warning = "ignoring the system socket at " .. sys .. ": " .. why
+	end
+	return user_path(), "user", warning
+end
+local function default_path() return (M.resolve_socket()) end
 M.default_path = default_path
 
 local Conn = {}
@@ -129,7 +146,7 @@ end
 -- Sleep for `us` microseconds (sub-millisecond capable).
 M.sleep_us = net.sleep_us
 
-local function unserved_msg(cause, attempt, waited_us, timeout_us, last)
+local function unserved_msg(path, cause, attempt, waited_us, timeout_us, last)
 	local why = (last and last ~= "") and (" (last reply: " .. (last:gsub("%s+$", "")) .. ")") or ""
 	local detail
 	if cause == "timeout" then
@@ -140,7 +157,7 @@ local function unserved_msg(cause, attempt, waited_us, timeout_us, last)
 	else
 		detail = "after " .. attempt .. " attempts (waited " .. waited_us .. "us)"
 	end
-	return "daemon at " .. default_path() .. " is reachable but would not serve a UUID " ..
+	return "daemon at " .. path .. " is reachable but would not serve a UUID " ..
 		detail .. why .. "; refusing to silently generate locally (that could break monotonicity). " ..
 		"Retry, raise UUIDV7_DAEMON_RETRY_TIMEOUT_US, or stop the daemon with `uuidv7 --api +++`."
 end
@@ -167,6 +184,8 @@ function M.try_daemon(args, opts)
 		else return "pass" end   -- unknown flag => let the local CLI handle it
 	end
 	if static then return "pass" end   -- explicit time stays local (reproducible)
+	local path, kind, warning = M.resolve_socket()
+	if warning then (opts.warn or function(w) io.stderr:write("uuidv7: " .. w .. "\n") end)(warning) end
 	local base_tok     = hyphen and "-" or ""
 	local attempts_cap = opts.attempts   or M.retry_attempts()
 	local timeout_us   = opts.timeout_us or M.retry_timeout_us()
@@ -178,21 +197,26 @@ function M.try_daemon(args, opts)
 		attempt = attempt + 1
 		-- On a retry, tell the daemon the attempt # and total wait so it logs them.
 		local line = (attempt > 1) and (base_tok .. "R" .. attempt .. "W" .. waited_us) or base_tok
-		local resp = M.oneshot(nil, line)
+		local resp = M.oneshot(path, line)
 		if resp == nil then
+			-- A trusted system socket file whose connection is refused: the service
+			-- crashed and its manager is restarting it. Never go local or to the
+			-- per-user daemon; other processes draw from the service.
+			if kind == "system" then return M.service_refused(path) end
 			-- Couldn't connect: no live daemon (or a stale socket). Local generation is
 			-- the correct standalone behavior — there is no live stream to violate.
 			return "pass"
 		end
+		if kind == "system" and attempt == 1 then M.service_reachable() end
 		if resp ~= "" and not resp:match("^ERR") then
 			return "emit", resp
 		end
 		last = resp   -- reachable but empty/ERR: retry the DAEMON, never go local
 		if attempt >= attempts_cap then
-			return "error", unserved_msg("attempts", attempt, waited_us, timeout_us, last)
+			return "error", unserved_msg(path, "attempts", attempt, waited_us, timeout_us, last)
 		end
 		if waited_us + delay > timeout_us then
-			return "error", unserved_msg("timeout", attempt, waited_us, timeout_us, last)
+			return "error", unserved_msg(path, "timeout", attempt, waited_us, timeout_us, last)
 		end
 		sleep(delay)
 		waited_us = waited_us + delay
@@ -200,16 +224,56 @@ function M.try_daemon(args, opts)
 	end
 end
 
+-- ===== refused system socket =====
+-- When the system service's socket file exists but connections are refused (the
+-- service crashed and left it), the service manager restarts the service. The
+-- first SERVICE_RESTARTS consecutive refusals fail with a try-again message;
+-- later ones are an error. The count lives in the per-user state directory.
+M.SERVICE_RESTARTS = 3
+local U32_MAX = 4294967295
+
+-- From the stored count text (plain decimal; anything else is no prior
+-- refusals): the count to store next and "try_again" or "give_up". Saturating.
+function M.service_refusal(prior)
+	local prior_n = 0
+	if prior:match("^%d+$") then
+		prior_n = #prior:gsub("^0+", "") > 10 and U32_MAX or math.min(tonumber(prior), U32_MAX)
+	end
+	local count = math.min(prior_n + 1, U32_MAX)
+	return count, (count <= M.SERVICE_RESTARTS) and "try_again" or "give_up"
+end
+
+local REFUSALS_FILE = "service_refusals"
+local EXIT_TEMPFAIL = 75   -- sysexits EX_TEMPFAIL: try again later
+
+-- Count one more consecutive refusal; returns "error", message, exit status.
+function M.service_refused(path)
+	local count, action = M.service_refusal(core.read_state_text(REFUSALS_FILE) or "")
+	core.write_state_text(REFUSALS_FILE, tostring(count))
+	if action == "try_again" then
+		return "error", ("no service on this request, restarting; please try again (the system service at %s " ..
+			"refused the connection; refusal %d of %d)"):format(path, count, M.SERVICE_RESTARTS), EXIT_TEMPFAIL
+	end
+	return "error", ("the system service at %s is not running: it refused %d requests in a row, more than " ..
+		"the %d restarts allowed. Have an administrator restart or uninstall it."):format(path, count, M.SERVICE_RESTARTS), 1
+end
+
+-- The system service accepted a connection: clear a nonzero refusal count.
+function M.service_reachable()
+	local t = core.read_state_text(REFUSALS_FILE)
+	if t and t ~= "0" then core.write_state_text(REFUSALS_FILE, "0") end
+end
+
 -- CLI fast-path: route LIVE generation to a running daemon if present. Returns true
 -- if it handled the request (printed a daemon-served UUID); false to let the local
 -- CLI generate. Exits non-zero if a reachable daemon refuses to serve (no silent
 -- fallback — see M.try_daemon).
 function M.maybe_handle(args)
-	local action, payload = M.try_daemon(args)
+	local action, payload, status = M.try_daemon(args)
 	if action == "emit" then io.write(payload); return true end
 	if action == "error" then
 		io.stderr:write("uuidv7: " .. payload .. "\n")
-		os.exit(1)
+		os.exit(status or 1)
 	end
 	return false   -- "pass": no daemon involved, generate locally
 end

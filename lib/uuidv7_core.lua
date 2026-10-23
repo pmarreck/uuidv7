@@ -294,6 +294,136 @@ function M.state_file(name)
 	return dir and (dir .. "/" .. name)
 end
 
+-- Small text files in the private state directory (for example the system
+-- service refusal count). Read returns nil when absent or unreadable; write
+-- reports success. Both refuse a state directory that is not private.
+function M.read_state_text(name)
+	local dir = M.state_dir()
+	if not dir then return nil end
+	if is_windows then
+		local f = io.open(dir .. "\\" .. name, "rb"); if not f then return nil end
+		local t = f:read("*a"); f:close(); return t
+	end
+	local dfd = M.open_private_dir(dir)
+	if not dfd then return nil end
+	local fd = C.openat(dfd, name, O_NOFOLLOW, ffi.new("int", 0))
+	C.close(dfd)
+	if fd < 0 then return nil end
+	local buf = ffi.new("char[64]")
+	local n = C.read(fd, buf, 64)
+	C.close(fd)
+	return n >= 0 and ffi.string(buf, n) or nil
+end
+function M.write_state_text(name, text)
+	local dir = M.state_dir()
+	if not dir then return false end
+	if is_windows then
+		M.ensure_dir(dir)
+		local f = io.open(dir .. "\\" .. name, "wb"); if not f then return false end
+		f:write(text); f:close(); return true
+	end
+	local dfd = M.open_private_dir(dir)
+	if not dfd then return false end
+	local fd = C.openat(dfd, name, bit.bor(O_CREAT, O_RDWR, O_NOFOLLOW), ffi.new("int", 384))   -- 0600
+	C.close(dfd)
+	if fd < 0 then return false end
+	C.ftruncate(fd, 0)
+	local w = C.write(fd, text, #text)
+	C.close(fd)
+	return w == #text
+end
+
+-- ===== system service socket =====
+-- An installed system service listens at a fixed path in a directory only an
+-- administrator can create: /run/uuidv7 (Linux), /var/run/uuidv7 (macOS),
+-- %ProgramData%\uuidv7 (Windows). UUIDV7_SYSTEM_SOCK overrides the path.
+local SYSTEM_SOCK_DEFAULT = is_macos and "/var/run/uuidv7/uuidv7.sock" or "/run/uuidv7/uuidv7.sock"
+local CSIDL_COMMON_APPDATA = 0x23
+if is_windows then
+	ffi.cdef[[
+		uint32_t GetFileAttributesA(const char *path);
+		uint32_t GetNamedSecurityInfoA(const char *name, int type, uint32_t info, void **owner, void **group, void **dacl, void **sacl, void **sd);
+		int IsWellKnownSid(void *sid, int type);
+		int EqualSid(void *a, void *b);
+		void *LocalFree(void *mem);
+		void *GetCurrentProcess(void);
+		int OpenProcessToken(void *process, uint32_t access, void **token);
+		int GetTokenInformation(void *token, int cls, void *info, uint32_t len, uint32_t *ret);
+	]]
+else
+	ffi.cdef[[ int access(const char *path, int mode); ]]
+end
+
+function M.system_socket_path()
+	local o = os.getenv("UUIDV7_SYSTEM_SOCK")
+	if o and o ~= "" then return o end
+	if is_windows then
+		local buf = ffi.new("char[260]")
+		local ok, rc = pcall(function() return ffi.load("shell32").SHGetFolderPathA(nil, CSIDL_COMMON_APPDATA, nil, 0, buf) end)
+		if not ok or rc ~= 0 then return nil end
+		return ffi.string(buf) .. "\\uuidv7\\uuidv7.sock"
+	end
+	return SYSTEM_SOCK_DEFAULT
+end
+
+function M.path_exists(path)
+	if is_windows then return C.GetFileAttributesA(path) ~= 0xFFFFFFFF end
+	return C.access(path, 0) == 0
+end
+
+-- Windows: is `path` owned by LocalSystem, LocalService, NetworkService,
+-- Administrators or the current user? (GetNamedSecurityInfo owner SID.)
+local function win_trusted_owner(path)
+	local advapi = ffi.load("advapi32")
+	local owner, sd = ffi.new("void*[1]"), ffi.new("void*[1]")
+	local SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION = 1, 1
+	if advapi.GetNamedSecurityInfoA(path, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, owner, nil, nil, nil, sd) ~= 0 then
+		return false
+	end
+	local trusted = false
+	for _, wk in ipairs({ 22, 23, 24, 26 }) do   -- WinLocalSystem/LocalService/NetworkService/BuiltinAdministrators
+		if advapi.IsWellKnownSid(owner[0], wk) ~= 0 then trusted = true end
+	end
+	if not trusted then
+		local tok = ffi.new("void*[1]")
+		if advapi.OpenProcessToken(C.GetCurrentProcess(), 8, tok) ~= 0 then   -- TOKEN_QUERY
+			local info, got = ffi.new("uint8_t[256]"), ffi.new("uint32_t[1]")
+			if advapi.GetTokenInformation(tok[0], 1, info, 256, got) ~= 0 then   -- TokenUser
+				trusted = advapi.EqualSid(owner[0], ffi.cast("void**", info)[0]) ~= 0
+			end
+			C.CloseHandle(tok[0])
+		end
+	end
+	C.LocalFree(sd[0])
+	return trusted
+end
+
+-- Whether a system socket at `path` can only have been placed by an
+-- administrator, the service or this user. POSIX: its directory is a real
+-- directory (not a symlink) owned by root or this user that group and other
+-- cannot write. Windows: the directory and the socket file are owned by a
+-- system account, Administrators or this user. Returns ok, reason.
+function M.trusted_socket(path)
+	local dir = path:match("^(.*)[/\\][^/\\]+$") or "."
+	if is_windows then
+		if not win_trusted_owner(dir) then return false, "its directory " .. dir .. " is not owned by an administrator, a system account or this user" end
+		if not win_trusted_owner(path) then return false, "it is not owned by an administrator, a system account or this user" end
+		return true
+	end
+	local fd = C.open(dir, bit.bor(O_DIRECTORY, O_NOFOLLOW), ffi.new("int", 0))
+	if fd < 0 then return false, "its directory " .. dir .. " is not a real directory" end
+	local st = ffi.new("uint8_t[256]")
+	local ok = false
+	if C.fstat(fd, st) == 0 then
+		local mode = ST_MODE_U16 and ffi.cast("uint16_t*", st + ST_MODE_OFF)[0] or ffi.cast("uint32_t*", st + ST_MODE_OFF)[0]
+		local uid = ffi.cast("uint32_t*", st + ST_UID_OFF)[0]
+		ok = bit.band(mode, S_IFMT) == S_IFDIR and (uid == 0 or uid == C.geteuid()) and bit.band(mode, 18) == 0   -- 022
+	end
+	C.close(fd)
+	if not ok then return false, "its directory " .. dir .. " is not owned by root or this user, or group or other can write it" end
+	return true
+end
+
 -- Filesystem (Linux and macOS CLI default): flock'd file in the state directory, atomic cross-process RMW.
 local FsCounter = {}
 FsCounter.__index = FsCounter

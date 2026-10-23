@@ -129,6 +129,23 @@ int uuidv7_retry_attempts(const char *no_retry, size_t no_retry_len,
  * saturating); else 2000. */
 int uuidv7_retry_timeout_us(const char *text, size_t text_len, uint64_t *out);
 
+/*
+ * Refused system socket. When the installed system service's socket file exists
+ * but connections are refused (the service crashed and left it), the service
+ * manager restarts the service. Clients count consecutive refusals in the
+ * per-user state directory: the first UUIDV7_SERVICE_RESTARTS fail with a
+ * try-again message, later ones are an error. The caller reads and writes the
+ * count file.
+ */
+#define UUIDV7_SERVICE_RESTARTS   3
+#define UUIDV7_SERVICE_TRY_AGAIN  0  /* "no service on this request, restarting; please try again" */
+#define UUIDV7_SERVICE_GIVE_UP    1  /* the service is not running: an error */
+
+/* From the stored count text (plain decimal; anything else, including empty,
+ * counts as no prior refusals): the count to store next and the action, one of
+ * UUIDV7_SERVICE_*. Saturates at UINT32_MAX. */
+int uuidv7_service_refusal(const char *prior, size_t prior_len, uint32_t *count, uint8_t *action);
+
 #ifdef __cplusplus
 }
 #endif

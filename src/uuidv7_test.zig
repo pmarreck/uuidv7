@@ -214,3 +214,33 @@ test "retry config from environment text: decimal integers only, else defaults" 
 	try testing.expectEqual(@as(u64, 2000), core.retryTimeoutUs("-5"));
 	try testing.expectEqual(@as(u64, std.math.maxInt(u64)), core.retryTimeoutUs("99999999999999999999999"));
 }
+
+// ---- refused system socket (oracle: lib/uuidv7_client.lua service_refusal) ----
+
+test "service refusal: the first three consecutive refusals say try again, later ones give up" {
+	try testing.expectEqual(@as(u32, 3), core.service_restarts);
+	const want = [_]struct { prior: []const u8, count: u32, action: core.ServiceRefusal }{
+		.{ .prior = "", .count = 1, .action = .try_again },
+		.{ .prior = "0", .count = 1, .action = .try_again },
+		.{ .prior = "1", .count = 2, .action = .try_again },
+		.{ .prior = "2", .count = 3, .action = .try_again },
+		.{ .prior = "3", .count = 4, .action = .give_up },
+		.{ .prior = "41", .count = 42, .action = .give_up },
+	};
+	for (want) |w| {
+		const got = core.serviceRefusal(w.prior);
+		try testing.expectEqual(w.count, got.count);
+		try testing.expectEqual(w.action, got.action);
+	}
+}
+
+test "service refusal: a garbled or empty stored count restarts from zero; a huge one saturates" {
+	for ([_][]const u8{ "", "x", "-1", "1.5", " 2", "2\n", "0x3" }) |t| {
+		const got = core.serviceRefusal(t);
+		try testing.expectEqual(@as(u32, 1), got.count);
+		try testing.expectEqual(core.ServiceRefusal.try_again, got.action);
+	}
+	const big = core.serviceRefusal("99999999999999999999999");
+	try testing.expectEqual(@as(u32, std.math.maxInt(u32)), big.count);
+	try testing.expectEqual(core.ServiceRefusal.give_up, big.action);
+}

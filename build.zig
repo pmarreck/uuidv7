@@ -53,6 +53,7 @@ pub fn build(b: *std.Build) void {
 		cli_module.linkSystemLibrary("bcrypt", .{});
 		cli_module.linkSystemLibrary("ws2_32", .{});
 		cli_module.linkSystemLibrary("shell32", .{});
+		cli_module.linkSystemLibrary("advapi32", .{});
 	}
 	const cli = b.addExecutable(.{ .name = "uuidv7z", .root_module = cli_module });
 	b.installArtifact(cli);

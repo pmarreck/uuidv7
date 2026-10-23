@@ -75,6 +75,22 @@ The extra cost is 12 syscalls per lock (directory open and check, file open,
 flock, read, ftruncate, write, close; strace counts). `pread`/`pwrite` and a
 fixed-width record could drop three of them if this matters later.
 
+Phase 2 done (2026-10-23): both clients follow the discovery order and the trust
+check above, and the refused-socket policy (exit 75 "please try again" for the
+first 3 consecutive refusals, then exit 1; count in the per-user state directory
+file `service_refusals`). The count rule is in the Zig core
+(`serviceRefusal`, `uuidv7_service_refusal`) with the Lua client as its
+differential oracle. `tests/uuidv7_system_socket_test` covers the order, a
+classifier over directory modes, a symlinked directory and the refusal
+sequence across both CLIs. Not tested: the Windows untrusted-owner case (the
+suite cannot create a directory owned by another account); only the trusted
+current-user owner is exercised there.
+
+Needed before any service ships (phase 3): the daemon accepts control
+commands (`+++`, `r`, `l`) from anyone who can connect. With a socket every
+local user can reach, the service must refuse them and leave stop/restart to
+the service manager.
+
 ## Install
 
 Shipped as files, never installed silently or with automatic `sudo`:

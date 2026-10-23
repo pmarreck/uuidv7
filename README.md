@@ -161,6 +161,27 @@ wait timeout (`UUIDV7_DAEMON_RETRY_TIMEOUT_US`, default 2000) is hit. `UUIDV7_DA
 errors on the first failure instead of retrying. Local generation happens only when **no**
 daemon answers the socket (the normal standalone mode) — that's not a fallback.
 
+Both CLIs pick the daemon socket in this order:
+
+1. `UUIDV7_SOCK`, if set.
+2. An installed system service's socket, if its file exists: `/run/uuidv7/uuidv7.sock`
+   on Linux, `/var/run/uuidv7/uuidv7.sock` on macOS, `%ProgramData%\uuidv7\uuidv7.sock`
+   on Windows (`UUIDV7_SYSTEM_SOCK` overrides the path). It is used only if nobody but an
+   administrator, the service or you could have put it there: on Linux and macOS its
+   directory must be a real directory owned by root or you that group and other cannot
+   write; on Windows the directory and the socket must be owned by a system account,
+   Administrators or you. Otherwise the CLI says it is ignoring it and goes on.
+3. The per-user daemon socket, `/tmp/uuidv7-<uid>/uuidv7.sock`.
+4. No daemon: the per-user counter file.
+
+If a trusted system socket refuses connections (the service crashed and left its socket
+file), the request fails rather than going to the per-user daemon or the file, because
+other processes draw from the service. The service manager restarts it; meanwhile the
+first 3 such requests in a row exit 75 with "no service on this request, restarting;
+please try again", and later ones exit 1 saying the service is not running. The count is
+kept in the per-user state directory and resets when the service answers again.
+Concurrent refused requests can each read the same count, so it is approximate.
+
 It's a line-based protocol (newline-terminated, no spaces), so it's `nc -U`-friendly:
 
 ```

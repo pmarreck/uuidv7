@@ -1,0 +1,184 @@
+#!/usr/bin/env luajit
+-- Client discovery of an installed system service, for both CLIs (uuidv7, uuidv7z):
+--   1. UUIDV7_SOCK, 2. the system socket when its file exists in a trusted
+--   directory, 3. the per-user daemon, 4. the per-user counter file.
+-- A trusted directory is a real directory owned by root or this user that group
+-- and other cannot write. A system socket whose connection is refused (service
+-- crashed, socket file left behind) makes the request fail with a try-again
+-- message (exit 75) for UUIDV7_SERVICE_RESTARTS (3) consecutive refusals while
+-- the service manager restarts it; after that it is an error (exit 1).
+-- UUIDV7_SYSTEM_SOCK points the clients at a system socket in a private test
+-- directory. No sleeps: daemons announce readiness on stdout.
+local self_dir = (arg and arg[0] or ""):match("^(.*)[/\\][^/\\]+$") or "."
+package.path = self_dir .. "/../lib/?.lua;" .. package.path
+local client = require("uuidv7_client")
+local sh = dofile(self_dir .. "/uuidv7_testsh.lua")
+local is_windows = jit.os == "Windows"
+
+local zcli = os.getenv("UUIDV7Z")
+if not zcli or zcli == "" then
+	io.stderr:write("uuidv7_system_socket_test: set UUIDV7Z to the uuidv7z executable\n")
+	os.exit(1)
+end
+
+local tests, fails = 0, 0
+local function ok(name, cond, detail)
+	tests = tests + 1
+	if cond then io.write("\u{2713} " .. name .. "\n")
+	else io.stderr:write("\u{2717} " .. name .. (detail and (": " .. tostring(detail)) or "") .. "\n"); fails = fails + 1 end
+end
+
+local base = (os.getenv("TMPDIR") or os.getenv("TEMP") or "/tmp"):gsub("/+$", "")
+local run = base .. "/uuidv7_systest_" .. tostring(os.time())
+local state, sysdir, sysstate = run .. "/state", run .. "/sys", run .. "/sysstate"
+sh.execute(string.format("mkdir -p '%s' '%s' '%s' && chmod 700 '%s' '%s' && chmod 755 '%s'",
+	state, sysdir, sysstate, state, sysstate, sysdir))
+local usock, ssock = state .. "/uuidv7.sock", sysdir .. "/uuidv7.sock"
+local exe = self_dir .. "/../bin/uuidv7"
+local libp = self_dir .. "/../lib/?.lua;;"
+local progs = { { name = "uuidv7", path = exe }, { name = "uuidv7z", path = zcli } }
+
+local function read_file(p) local f = io.open(p, "rb"); if not f then return "" end; local s = f:read("*a"); f:close(); return s end
+local function wait_for(h, marker)
+	while true do local l = h:read("*l"); if not l then return false end; if l:find(marker, 1, true) then return true end end
+end
+-- Client environment: per-user state in `state`, system socket at `sys`.
+local function cenv(sys, extra)
+	return string.format("UUIDV7_STATE_DIR=%q UUIDV7_SYSTEM_SOCK=%q LUA_PATH=%q UUIDV7_SILENCE_INSECURE_RANDOM=1 %s",
+		state, sys or ssock, libp, extra or "")
+end
+-- Run a CLI; returns stdout, stderr, exit status.
+local function cli(env, prog, args)
+	local errf = run .. "/err"
+	local h = sh.popen(string.format("env %s %q %s 2>%q; echo \"rc=$?\"", env, prog, args or "", errf), "r")
+	local out = h:read("*a"); h:close()
+	local rc = tonumber(out:match("rc=(%d+)\n?$"))
+	return (out:gsub("rc=%d+\n?$", "")), read_file(errf), rc
+end
+local function served(sock) return tonumber((client.oneshot(sock, "sj") or ""):match('"uuids_served":(%d+)')) end
+local function is_uuid_line(out) return out:match("^%x+\n$") ~= nil and #out == 33 end
+
+-- Daemons: the per-user one in `state`, the "system" one at `sysdir` with its own state.
+local daemons = {}
+local function start_daemon(key, sock, sdir)
+	local h = sh.popen(string.format("env UUIDV7_SOCK=%q UUIDV7_STATE_DIR=%q UUIDV7_LOG=%q LUA_PATH=%q UUIDV7_SILENCE_INSECURE_RANDOM=1 %q --daemon 2>>%q",
+		sock, sdir, run .. "/" .. key .. ".log", libp, exe, run .. "/derr"), "r")
+	local up = wait_for(h, "UUIDV7-LISTENING")
+	daemons[key] = { h = h, sock = sock, pid = (client.oneshot(sock, "sj") or ""):match('"pid":(%d+)') }
+	return up
+end
+local function hard_kill(key)
+	local d = daemons[key]; if not d then return end
+	if d.pid then sh.kill(d.pid, true) end
+	pcall(function() d.h:close() end)
+	daemons[key] = nil
+end
+
+local function body()
+	ok("per-user daemon starts", start_daemon("user", usock, state))
+	ok("system daemon starts", start_daemon("sys", ssock, sysstate))
+
+	for _, p in ipairs(progs) do
+		local s0, u0 = served(ssock), served(usock)
+		local out, err, rc = cli(cenv(), p.path)
+		ok(p.name .. ": the system service is preferred to the per-user daemon",
+			rc == 0 and is_uuid_line(out) and err == "" and served(ssock) == s0 + 1 and served(usock) == u0,
+			string.format("rc=%s out=%q err=%q", tostring(rc), out, err))
+
+		s0, u0 = served(ssock), served(usock)
+		out, err, rc = cli(cenv(nil, string.format("UUIDV7_SOCK=%q", usock)), p.path)
+		ok(p.name .. ": UUIDV7_SOCK is preferred to the system service",
+			rc == 0 and is_uuid_line(out) and served(usock) == u0 + 1 and served(ssock) == s0, err)
+
+		s0, u0 = served(ssock), served(usock)
+		out, err, rc = cli(cenv(sysdir .. "/absent.sock"), p.path)
+		ok(p.name .. ": without a system socket file the per-user daemon serves",
+			rc == 0 and is_uuid_line(out) and err == "" and served(usock) == u0 + 1 and served(ssock) == s0, err)
+
+		out, err, rc = cli(cenv(), p.path, "1700000000000000000")
+		ok(p.name .. ": an explicit time stays local", rc == 0 and is_uuid_line(out) and served(ssock) == s0, err)
+	end
+
+	do
+		local out = cli(cenv(), exe, "--api sj")
+		ok("uuidv7 --api talks to the system service", out:match('"pid":' .. tostring(daemons.sys.pid) .. "[,}]") ~= nil, out)
+	end
+
+	-- Trust check, as a classifier over directory modes (POSIX).
+	if is_windows then
+		io.write("n/a: directory mode classifier (Windows checks owners, not modes)\n")
+	else
+		local trusted = { "700", "711", "750", "755", "555" }
+		local untrusted = { "775", "757", "777", "722", "770", "1777" }
+		for _, p in ipairs(progs) do
+			local wrong = {}
+			local function classify(mode, want_system)
+				sh.execute(string.format("chmod %s '%s'", mode, sysdir))
+				local s0, u0 = served(ssock), served(usock)
+				local out, err, rc = cli(cenv(), p.path)
+				local got_system = served(ssock) == s0 + 1 and served(usock) == u0
+				local got_user = served(usock) == u0 + 1 and served(ssock) == s0
+				local warned = err:find("ignoring the system socket", 1, true) ~= nil
+				local right = rc == 0 and is_uuid_line(out) and
+					(want_system and got_system and err == "" or (not want_system) and got_user and warned)
+				if not right then wrong[#wrong + 1] = mode .. string.format("(rc=%s err=%q)", tostring(rc), err) end
+			end
+			for _, m in ipairs(trusted) do classify(m, true) end
+			for _, m in ipairs(untrusted) do classify(m, false) end
+			sh.execute(string.format("chmod 755 '%s'", sysdir))
+			ok(p.name .. ": trusts exactly the directories group and other cannot write", #wrong == 0, table.concat(wrong, " "))
+		end
+		-- A symlinked directory is not trusted, even to a trusted target.
+		sh.execute(string.format("ln -s '%s' '%s'", sysdir, run .. "/syslink"))
+		for _, p in ipairs(progs) do
+			local u0 = served(usock)
+			local out, err, rc = cli(cenv(run .. "/syslink/uuidv7.sock"), p.path)
+			ok(p.name .. ": a system socket reached through a symlinked directory is ignored",
+				rc == 0 and is_uuid_line(out) and served(usock) == u0 + 1 and err:find("ignoring the system socket", 1, true) ~= nil, err)
+		end
+	end
+
+	-- Crash: the socket file stays, connections are refused. Both CLIs share the
+	-- per-user refusal count.
+	hard_kill("sys")
+	local seq = { exe, zcli, exe, zcli, exe }
+	local got = {}
+	for i, prog in ipairs(seq) do
+		local out, err, rc = cli(cenv(), prog)
+		got[i] = { out = out, err = err, rc = rc }
+	end
+	local function try_again(g) return g.rc == 75 and g.out == "" and g.err:find("no service on this request, restarting; please try again", 1, true) ~= nil end
+	local function gave_up(g) return g.rc == 1 and g.out == "" and g.err:find("not running", 1, true) ~= nil end
+	ok("refusals 1-3 say the service is restarting and exit 75",
+		try_again(got[1]) and try_again(got[2]) and try_again(got[3]),
+		got[1].err .. " | " .. tostring(got[1].rc))
+	ok("refusal 4 and later are errors (exit 1)", gave_up(got[4]) and gave_up(got[5]), got[4].err .. " | " .. tostring(got[4].rc))
+	ok("a refused system socket never falls back to the per-user daemon",
+		got[1].out == "" and got[4].out == "")
+
+	ok("system daemon restarts", start_daemon("sys", ssock, sysstate))
+	do
+		local s0 = served(ssock)
+		local out, err, rc = cli(cenv(), exe)
+		ok("a served request after the restart succeeds", rc == 0 and is_uuid_line(out) and served(ssock) == s0 + 1, err)
+	end
+	hard_kill("sys")
+	do
+		local out, err, rc = cli(cenv(), zcli)
+		ok("a success resets the refusal count", try_again({ out = out, err = err, rc = rc }), err .. " | " .. tostring(rc))
+	end
+end
+
+local okrun, err = pcall(body)
+for k in pairs(daemons) do
+	local d = daemons[k]
+	if d.pid and client.oneshot(d.sock, "+++") then d.h:read("*a") elseif d.pid then sh.kill(d.pid, true) end
+	pcall(function() d.h:close() end)
+end
+local derr = read_file(run .. "/derr")
+if derr ~= "" then io.stderr:write("----- daemon stderr -----\n" .. derr .. "-------------------------\n") end
+sh.execute("chmod -R u+w '" .. run .. "' 2>/dev/null; rm -rf '" .. run .. "' 2>/dev/null")
+sh.cleanup()
+if not okrun then io.stderr:write("system socket test crashed: " .. tostring(err) .. "\n"); os.exit(1) end
+if fails > 0 then io.stderr:write(fails .. " of " .. tests .. " system socket tests failed!\n"); os.exit(1) end
+io.write("All " .. tests .. " system socket tests passed!\n")

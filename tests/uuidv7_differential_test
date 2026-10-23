@@ -446,5 +446,41 @@ do
 		Z.uuidv7_retry_request(retry, 1, line_buf, 0, len_out) == H.UUIDV7_ERR_BUFFER)
 end
 
+-- ---------- 8. refused system socket: refusal count and action vs client.service_refusal ----------
+-- Fixed edge texts plus seeded decimal and non-decimal stored counts; the stored
+-- count and the try-again/give-up decision must agree.
+do
+	local client = require("uuidv7_client")
+	local count_out = ffi.new("uint32_t[1]")
+	local act_out = ffi.new("uint8_t[1]")
+	local texts = { "", "0", "1", "2", "3", "4", "4294967294", "4294967295", "4294967296",
+		"99999999999999999999999", "x", "-1", "1.5", " 2", "2\n", "0x3", "\0", "1\0" }
+	for _ = 1, 200 * SCALE do
+		local n = randint(10)
+		if n < 6 then texts[#texts + 1] = dec(rand64() % ffi.cast("uint64_t", 10 ^ randint(12)))
+		else
+			local t = {}
+			for i = 1, 1 + randint(6) do t[i] = string.char(randint(256)) end
+			texts[#texts + 1] = table.concat(t)
+		end
+	end
+	local bad, first_bad = 0, nil
+	for _, t in ipairs(texts) do
+		local lc, la = client.service_refusal(t)
+		assert(Z.uuidv7_service_refusal(t, #t, count_out, act_out) == H.UUIDV7_OK)
+		local za = act_out[0] == H.UUIDV7_SERVICE_TRY_AGAIN and "try_again" or "give_up"
+		if lc ~= count_out[0] or la ~= za then
+			bad = bad + 1
+			first_bad = first_bad or ("%q: lua %s/%s zig %d/%s"):format(t, tostring(lc), la, count_out[0], za)
+		end
+	end
+	check(("service refusal agrees with the LuaJIT client over %d stored counts"):format(#texts), bad == 0, first_bad)
+	check("service restarts is 3 in both", H.UUIDV7_SERVICE_RESTARTS == 3 and client.SERVICE_RESTARTS == 3)
+	check("service_refusal refuses NULL text with a nonzero length or NULL outputs",
+		Z.uuidv7_service_refusal(nil, 1, count_out, act_out) == H.UUIDV7_ERR_NULL
+		and Z.uuidv7_service_refusal("", 0, nil, act_out) == H.UUIDV7_ERR_NULL
+		and Z.uuidv7_service_refusal("", 0, count_out, nil) == H.UUIDV7_ERR_NULL)
+end
+
 io.write(("%d/%d differential tests passed\n"):format(tests - fails, tests))
 os.exit(fails == 0 and 0 or 1)

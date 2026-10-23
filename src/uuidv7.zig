@@ -234,3 +234,22 @@ fn parseDecimalSaturating(text: []const u8) ?u64 {
 	if (!isDecimal(text)) return null;
 	return std.fmt.parseInt(u64, text, 10) catch std.math.maxInt(u64);
 }
+
+// ---- refused system socket ----
+// When the installed system service's socket file exists but connections are
+// refused (the service crashed and left it), the service manager restarts the
+// service. Clients count consecutive refusals in the per-user state directory:
+// the first `service_restarts` fail with a try-again message, later ones are an
+// error. The caller reads and writes the count file.
+
+pub const service_restarts: u32 = 3;
+
+pub const ServiceRefusal = enum { try_again, give_up };
+
+/// The refusal count to store and what to report, from the stored count text
+/// (plain decimal; anything else counts as no prior refusals). Saturating.
+pub fn serviceRefusal(prior: []const u8) struct { count: u32, action: ServiceRefusal } {
+	const p: u32 = if (parseDecimalSaturating(prior)) |n| (std.math.cast(u32, n) orelse std.math.maxInt(u32)) else 0;
+	const count = p +| 1;
+	return .{ .count = count, .action = if (count <= service_restarts) .try_again else .give_up };
+}
