@@ -8,7 +8,6 @@ Open work in priority order. Completed items: [docs/PLAN_LOG.md](docs/PLAN_LOG.m
 - [x] Shared machine-wide counter (BDFN goal 2026-10-14: monotonicity across the whole machine): uuidv7 and uuidv7z share one locked state file, and uuidv7z uses a running daemon (done 2026-10-14 18:13 EDT)
 	- [x] uuidv7z uses the shared `$TMPDIR/uuidv7-sequence` file; alternating and mixed-concurrent cross-CLI tests (done 2026-10-14 18:02 EDT)
 	- [x] uuidv7z routes live generation to a running uuidv7 daemon (C client over AF_UNIX / Winsock; retry policy in the Zig core, 968a3e0) (done 2026-10-14 18:13 EDT)
-- [x] Reproducible Windows test toolchain: flake output luajit-windows-x86_64 + import check, and ./test-windows runner (done 2026-10-14 14:32 EDT)
 - [ ] Counter/daemon scope audit (Turing request 2026-10-14): state file and socket are found via TMPDIR/XDG_RUNTIME_DIR, so sharing is per matching environment; add deterministic regressions for differing TMPDIR, daemon/standalone transitions and unsafe shared /tmp, then fix within per-user scope (context: docs/plan_context/counter_scope.md)
 	- [x] Measure the boundaries: differing TMPDIR 20/40 out of order, nix develop sets a per-shell TMPDIR, unusable file falls back silently, socket uses a different lookup (done 2026-10-14 19:25 EDT)
 	- [x] Fix: state file written through a planted symlink (O_NOFOLLOW in both CLIs, tests/uuidv7_state_safety_test) (done 2026-10-14 19:21 EDT, 7746c5a)
@@ -21,7 +20,8 @@ Open work in priority order. Completed items: [docs/PLAN_LOG.md](docs/PLAN_LOG.m
 	- [ ] Phase 4: launchd socket activation and plist (real-host sudo needs approval)
 	- [ ] Phase 5: Windows service host (install on the test host needs approval)
 	- [x] Decided: refused system socket -> service restarted up to N times with a try-again message, then an error; macOS state in /private/tmp by default, configurable (done 2026-10-21 14:46 EDT)
-	- [ ] Confirm who restarts a crashed system service (service manager vs client) and the value of N
+	- [x] Decided: the service manager restarts a crashed system service (systemd Restart=always + StartLimitBurst=N, launchd KeepAlive, SCM recovery actions) (done 2026-10-23 01:00 EDT)
+	- [ ] Choose N, the number of restarts before a refused system socket is an error (proposed 3)
 
 ## Awaiting BDFN decisions (queued in the walking brief)
 - [x] Decision uuidv7-counter-scope: BDFN chose per user now, cross-user later (terminal answer, 2026-10-15 12:50 EDT)

@@ -22,3 +22,7 @@ Completed PLAN.md items retired by plan-retire, oldest retirement first.
 
 - [x] [Done (recent)] BDFN chose to fix the inherited CLI argument quirks (done 2026-10-06 23:08 EDT)
 - [x] [Done (recent)] Both CLIs: order-independent flags, last timestamp wins, unknown/extra arguments error, -- ends options, extract takes one UUID (done 2026-10-06 23:13 EDT, bede2d2)
+
+## Retired 2026-10-23
+
+- [x] [Next (authorized, unblocked)] Reproducible Windows test toolchain: flake output luajit-windows-x86_64 + import check, and ./test-windows runner (done 2026-10-14 14:32 EDT)

@@ -43,13 +43,13 @@ those directories, so no other user can plant a socket there.
   stopped and the socket file remained): BDFN decided (2026-10-21) that the
   service is restarted up to N times while each affected request fails with
   "no service on this request, restarting; please try again", and after N
-  restarts the condition is treated as an error. Open detail: who restarts. An
-  unprivileged client cannot restart a system service on Linux or macOS, so the
-  proposal is that the service manager restarts it (systemd `Restart=always`
+  restarts the condition is treated as an error. BDFN decided (2026-10-23) that the
+  service manager restarts it, since an unprivileged client cannot restart a
+  system service (systemd `Restart=always`
   with `StartLimitBurst=N`, launchd `KeepAlive`, SCM recovery actions), and the
   client counts consecutive refusals in its per-user state directory to switch
   from the restarting message to the error. On Windows the service's DACL could
-  instead grant users `SERVICE_START`, so the client could start it itself.
+  instead grant users `SERVICE_START`; not used, for one rule on every OS.
   systemd and launchd keep listening on an activated socket themselves, so this
   mostly arises without socket activation.
 
