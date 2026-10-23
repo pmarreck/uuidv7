@@ -26,3 +26,4 @@ Completed PLAN.md items retired by plan-retire, oldest retirement first.
 ## Retired 2026-10-23
 
 - [x] [Next (authorized, unblocked)] Reproducible Windows test toolchain: flake output luajit-windows-x86_64 + import check, and ./test-windows runner (done 2026-10-14 14:32 EDT)
+- [x] [Next (authorized, unblocked)] Fix: Linux LuaJIT CLI's SysV shared-memory counter is unlocked (16 processes x 60 at one ns: 5-10 duplicates in 960); use the flock'd counter file as on macOS (done 2026-10-14 17:20 EDT, 7152467)

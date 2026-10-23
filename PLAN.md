@@ -3,7 +3,6 @@
 Open work in priority order. Completed items: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Direction and done criteria: [intents/three_os_and_zig_port.md](intents/three_os_and_zig_port.md).
 
 ## Next (authorized, unblocked)
-- [x] Fix: Linux LuaJIT CLI's SysV shared-memory counter is unlocked (16 processes x 60 at one ns: 5-10 duplicates in 960); use the flock'd counter file as on macOS (done 2026-10-14 17:20 EDT, 7152467)
 - [x] Windows daemon (BDFN chose C2, 2026-10-14): Winsock AF_UNIX + WSAPoll, handoff restart; daemon suites run on Windows (context: docs/plan_context/windows_daemon.md) (done 2026-10-14 17:55 EDT, cc2bd0f)
 - [x] Shared machine-wide counter (BDFN goal 2026-10-14: monotonicity across the whole machine): uuidv7 and uuidv7z share one locked state file, and uuidv7z uses a running daemon (done 2026-10-14 18:13 EDT)
 	- [x] uuidv7z uses the shared `$TMPDIR/uuidv7-sequence` file; alternating and mixed-concurrent cross-CLI tests (done 2026-10-14 18:02 EDT)
@@ -21,7 +20,9 @@ Open work in priority order. Completed items: [docs/PLAN_LOG.md](docs/PLAN_LOG.m
 	- [ ] Phase 5: Windows service host (install on the test host needs approval)
 	- [x] Decided: refused system socket -> service restarted up to N times with a try-again message, then an error; macOS state in /private/tmp by default, configurable (done 2026-10-21 14:46 EDT)
 	- [x] Decided: the service manager restarts a crashed system service (systemd Restart=always + StartLimitBurst=N, launchd KeepAlive, SCM recovery actions) (done 2026-10-23 01:00 EDT)
-	- [ ] Choose N, the number of restarts before a refused system socket is an error (proposed 3)
+	- [x] Decided: N = 3 restarts before a refused system socket is an error (done 2026-10-23 14:15 EDT)
+
+- [ ] Conform to the cross-platform build convention: PF-named bin/<PF>/ and zig-out/<PF>/[musl]/<profile>/, mswin token, ./run, --all-plats (BDFN 2026-10-23; context: docs/plan_context/build_layout.md)
 
 ## Awaiting BDFN decisions (queued in the walking brief)
 - [x] Decision uuidv7-counter-scope: BDFN chose per user now, cross-user later (terminal answer, 2026-10-15 12:50 EDT)
