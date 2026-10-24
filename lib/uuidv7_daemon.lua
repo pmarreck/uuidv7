@@ -234,7 +234,8 @@ local function shutdown(reason)
 	local s = stats_table(); s.reason = reason
 	log_event("shutdown", s)
 	close_log()
-	os.remove(server.sock_path)
+	-- A socket file the service manager created stays: it keeps listening on it.
+	if server.owns_socket then os.remove(server.sock_path) end
 	os.exit(0)
 end
 
@@ -267,6 +268,11 @@ local function dispatch(fd, line)
 		if v == "PING" then send_line(fd, "OK")
 		elseif v == "s" then send_all(fd, stats_human())
 		elseif v == "sj" then send_all(fd, stats_json())
+		elseif server.service and (v == "l" or v == "r" or v == "+++") then
+			-- Every local user can reach the service socket; only the service
+			-- manager may stop or restart it.
+			send_line(fd, "ERR " .. v .. " is refused in service mode; use the service manager")
+			log_event("error", { request = line, reason = "control command refused in service mode", peer_uid = peer_uid(fd) })
 		elseif v == "l" then log_event("stats", stats_table()); send_line(fd, "OK")
 		elseif v == "h" or v == "?" then send_all(fd, HELP)
 		elseif v == "r" then send_line(fd, "OK"); restart()
@@ -334,6 +340,8 @@ end
 
 -- ===== bind / adopt =====
 local function make_listener()
+	local sd = net.systemd_listen_fd()
+	if sd then return sd, "systemd" end
 	local adopted = os.getenv("UUIDV7_LISTEN_FD")
 	if adopted then return net.adopt(tonumber(adopted)), true end
 	local path = server.sock_path
@@ -365,6 +373,7 @@ function M.run(opts)
 		exe = resolve_exe(opts.arg0 or (arg and arg[0])),
 		max_batch = tonumber(os.getenv("UUIDV7_MAX_BATCH")) or 1000,
 		counter = core.new_counter("auto"),   -- write-through state file, shared with the CLIs
+		service = opts.service and true or false,
 		requests = 0, uuids_served = 0, last_batch = 0, peak_batch = 0,
 		k_same_ns = 0, k_rollback = 0, k_ts_ahead = 0, insecure_rng = 0,
 		conns_open = 0, conns_served = 0, retries = 0,
@@ -375,6 +384,7 @@ function M.run(opts)
 
 	local listen_fd, adopted = make_listener()
 	server.listen_fd = listen_fd
+	server.owns_socket = adopted ~= "systemd"
 	log_event(adopted and "restart-ready" or "start",
 		{ pid = net.getpid(), version = core.VERSION, socket = server.sock_path, adopted = adopted })
 

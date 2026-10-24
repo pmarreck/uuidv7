@@ -3,9 +3,6 @@
 Open work in priority order. Completed items: [docs/PLAN_LOG.md](docs/PLAN_LOG.md). Direction and done criteria: [intents/three_os_and_zig_port.md](intents/three_os_and_zig_port.md).
 
 ## Next (authorized, unblocked)
-- [x] Shared machine-wide counter (BDFN goal 2026-10-14: monotonicity across the whole machine): uuidv7 and uuidv7z share one locked state file, and uuidv7z uses a running daemon (done 2026-10-14 18:13 EDT)
-	- [x] uuidv7z uses the shared `$TMPDIR/uuidv7-sequence` file; alternating and mixed-concurrent cross-CLI tests (done 2026-10-14 18:02 EDT)
-	- [x] uuidv7z routes live generation to a running uuidv7 daemon (C client over AF_UNIX / Winsock; retry policy in the Zig core, 968a3e0) (done 2026-10-14 18:13 EDT)
 - [ ] Counter/daemon scope audit (Turing request 2026-10-14): state file and socket are found via TMPDIR/XDG_RUNTIME_DIR, so sharing is per matching environment; add deterministic regressions for differing TMPDIR, daemon/standalone transitions and unsafe shared /tmp, then fix within per-user scope (context: docs/plan_context/counter_scope.md)
 	- [x] Measure the boundaries: differing TMPDIR 20/40 out of order, nix develop sets a per-shell TMPDIR, unusable file falls back silently, socket uses a different lookup (done 2026-10-14 19:25 EDT)
 	- [x] Fix: state file written through a planted symlink (O_NOFOLLOW in both CLIs, tests/uuidv7_state_safety_test) (done 2026-10-14 19:21 EDT, 7746c5a)
@@ -14,7 +11,9 @@ Open work in priority order. Completed items: [docs/PLAN_LOG.md](docs/PLAN_LOG.m
 	- [x] Daemon persistence: write the per-user state file on every allocation (RAM) and seed from it at start; measure the cost (phase 1, context: docs/plan_context/system_service.md) (done 2026-10-21 15:05 EDT)
 - [ ] System service, layered default (BDFN 2026-10-19): plan approved 2026-10-21 (context: docs/plan_context/system_service.md)
 	- [x] Phase 2: client discovery order, system-socket trust check and refused-service policy (exit 75 x3, then 1) in uuidv7 and uuidv7z (done 2026-10-23 14:40 EDT)
-	- [ ] Phase 3: systemd socket activation, unit files, NixOS module; a service mode (`--daemon --service`) that refuses control commands (+++, r, l) while the per-user daemon keeps them (context: docs/plan_context/system_service.md)
+	- [x] Phase 3: systemd socket activation, unit files, NixOS module and NixOS VM test; `--daemon --service` refuses control commands (+++, r, l) while the per-user daemon keeps them (done 2026-10-23 23:50 EDT)
+	- [ ] Phase 3 on a real Linux host: enable the units and rerun the VM test's checks there (install needs approval)
+	- [ ] The service silently used an in-memory counter when its state directory was unusable (a symlink, found in the VM test); decide fail-closed vs warn with the unusable-state-file policy (context: docs/plan_context/system_service.md)
 	- [ ] Phase 4: launchd socket activation and plist (real-host sudo needs approval)
 	- [ ] Phase 5: Windows service host (install on the test host needs approval)
 	- [x] Decided: refused system socket -> service restarted up to N times with a try-again message, then an error; macOS state in /private/tmp by default, configurable (done 2026-10-21 14:46 EDT)

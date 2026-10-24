@@ -1,0 +1,136 @@
+#!/usr/bin/env luajit
+-- Service mode and systemd socket activation of the daemon.
+--   `uuidv7 --daemon --service` is how a service manager runs the machine-wide
+--   service. Its socket is open to every local user, so it refuses the control
+--   commands +++ (shut down), r (restart) and l (log) and leaves stopping and
+--   restarting to the service manager. Everything else, status included, works.
+--   With LISTEN_FDS/LISTEN_PID (systemd socket activation) the daemon adopts fd 3
+--   instead of binding, and does not remove the socket file it did not create.
+-- systemd-socket-activate provides the real handoff on Linux; elsewhere that part
+-- is n/a (systemd is Linux-only). No sleeps: daemons announce readiness on stdout.
+local self_dir = (arg and arg[0] or ""):match("^(.*)[/\\][^/\\]+$") or "."
+package.path = self_dir .. "/../lib/?.lua;" .. package.path
+local client = require("uuidv7_client")
+local sh = dofile(self_dir .. "/uuidv7_testsh.lua")
+local is_linux = jit.os == "Linux"
+local is_windows = jit.os == "Windows"
+
+local tests, fails = 0, 0
+local function ok(name, cond, detail)
+	tests = tests + 1
+	if cond then io.write("\u{2713} " .. name .. "\n")
+	else io.stderr:write("\u{2717} " .. name .. (detail and (": " .. tostring(detail)) or "") .. "\n"); fails = fails + 1 end
+end
+
+local base = (os.getenv("TMPDIR") or os.getenv("TEMP") or "/tmp"):gsub("/+$", "")
+local run = base .. "/uuidv7_svctest_" .. tostring(os.time())
+local state = run .. "/state"
+sh.execute(string.format("mkdir -p '%s' && chmod 700 '%s'", state, state))
+local exe = self_dir .. "/../bin/uuidv7"
+local libp = self_dir .. "/../lib/?.lua;;"
+local logf = run .. "/d.log"
+
+local function read_file(p) local f = io.open(p, "rb"); if not f then return nil end; local s = f:read("*a"); f:close(); return s end
+local function exists(p) return sh.execute(string.format("test -e '%s'", p)) end
+local function wait_for(h, marker)
+	while true do local l = h:read("*l"); if not l then return false end; if l:find(marker, 1, true) then return true end end
+end
+local function denv(sock, extra)
+	return string.format("UUIDV7_SOCK=%q UUIDV7_STATE_DIR=%q UUIDV7_LOG=%q LUA_PATH=%q UUIDV7_SILENCE_INSECURE_RANDOM=1 %s",
+		sock, state, logf, libp, extra or "")
+end
+local function pid_of(sock) return (client.oneshot(sock, "sj") or ""):match('"pid":(%d+)') end
+local function is_uuid(s) return (s or ""):match("^%x+\n$") ~= nil and #s == 33 end
+
+local handles = {}
+local function body()
+	-- 1. Service mode refuses control commands and keeps serving.
+	local sock = run .. "/svc.sock"
+	local h = sh.popen(string.format("env %s %q --daemon --service 2>>%q", denv(sock), exe, run .. "/derr"), "r")
+	handles[#handles + 1] = { h = h, sock = sock }
+	ok("service mode starts", wait_for(h, "UUIDV7-LISTENING"))
+	local pid = pid_of(sock)
+	handles[#handles].pid = pid
+	ok("service mode serves a UUID", is_uuid(client.oneshot(sock, "")))
+	ok("service mode answers PING", client.oneshot(sock, "PING") == "OK\n")
+	ok("service mode answers status (s, sj)",
+		(client.oneshot(sock, "s") or ""):match("uuids_served:") ~= nil and pid ~= nil)
+	for _, verb in ipairs({ "+++", "r", "l" }) do
+		local resp = client.oneshot(sock, verb) or ""
+		ok("service mode refuses " .. verb,
+			resp:match("^ERR ") ~= nil and resp:find("service manager", 1, true) ~= nil, resp)
+	end
+	ok("service mode keeps serving after the refusals", is_uuid(client.oneshot(sock, "")))
+	ok("service mode did not restart (same pid)", pid_of(sock) == pid)
+	local log = read_file(logf) or ""
+	ok("refused control commands are logged", select(2, log:gsub('"reason":"control command refused in service mode"', "")) == 3, log)
+	if is_windows then
+		io.write("n/a: stopping on SIGTERM (Windows has no SIGTERM; the backstop stops the daemon)\n")
+	else
+		ok("service mode stops on SIGTERM", sh.kill(pid) and h:read("*a") ~= nil)
+		pcall(function() h:close() end); handles[#handles] = nil
+		ok("service mode removes the socket file it bound", not exists(sock))
+	end
+
+	-- 2. Unknown daemon options are usage errors.
+	do
+		local hh = sh.popen(string.format("timeout 10 env %s %q --daemon --bogus 2>&1; echo \"rc=$?\"", denv(run .. "/bogus.sock"), exe), "r")
+		local out = hh:read("*a"); hh:close()
+		ok("--daemon with an unknown option exits 2", out:match("rc=2\n?$") ~= nil and out:find("--bogus", 1, true) ~= nil, out)
+		ok("--daemon with an unknown option binds no socket", not exists(run .. "/bogus.sock"))
+	end
+
+	-- 3. LISTEN_FDS meant for another process (LISTEN_PID mismatch) is ignored.
+	do
+		local s2 = run .. "/own.sock"
+		local h2 = sh.popen(string.format("env %s %q --daemon --service 2>>%q",
+			denv(s2, "LISTEN_FDS=1 LISTEN_PID=1"), exe, run .. "/derr"), "r")
+		handles[#handles + 1] = { h = h2, sock = s2 }
+		ok("LISTEN_PID of another process: the daemon binds its own socket",
+			wait_for(h2, "UUIDV7-LISTENING") and is_uuid(client.oneshot(s2, "")))
+		handles[#handles].pid = pid_of(s2)
+	end
+
+	-- 4. systemd socket activation (Linux).
+	if not is_linux then
+		io.write("n/a: systemd socket activation (systemd is Linux-only)\n")
+		return
+	end
+	local ssa = io.popen("command -v systemd-socket-activate"):read("*l")
+	ok("systemd-socket-activate is available (devShell provides systemd on Linux)", ssa ~= nil)
+	if not ssa then return end
+	local asock = run .. "/act.sock"
+	-- systemd-socket-activate passes the child only the variables named with -E.
+	local pass = ""
+	for _, v in ipairs({ "UUIDV7_SOCK", "UUIDV7_STATE_DIR", "UUIDV7_LOG", "LUA_PATH", "UUIDV7_SILENCE_INSECURE_RANDOM" }) do
+		pass = pass .. " -E " .. v
+	end
+	local ha = sh.popen(string.format("env %s %q -l %q%s luajit %q --daemon --service 2>&1",
+		denv(asock), ssa, asock, pass, exe), "r")
+	handles[#handles + 1] = { h = ha, sock = asock }
+	ok("systemd-socket-activate listens", wait_for(ha, "Listening on"))
+	-- The first connection makes systemd-socket-activate exec the daemon, which
+	-- adopts the queued listener and answers it.
+	ok("the activated daemon serves through the adopted socket", is_uuid(client.oneshot(asock, "")))
+	ok("the activated daemon announces readiness", wait_for(ha, "UUIDV7-LISTENING"))
+	local apid = pid_of(asock)
+	handles[#handles].pid = apid
+	local alog = read_file(logf) or ""
+	ok("the start event records an adopted socket", alog:find('"adopted":"systemd"', 1, true) ~= nil, alog)
+	ok("the activated daemon stops on SIGTERM", apid ~= nil and sh.kill(apid) and ha:read("*a") ~= nil)
+	pcall(function() ha:close() end); handles[#handles] = nil
+	ok("the socket file systemd created is left in place", exists(asock))
+end
+
+local okrun, err = pcall(body)
+for _, d in ipairs(handles) do
+	if d.pid then sh.kill(d.pid, true) end
+	pcall(function() d.h:close() end)
+end
+local derr = read_file(run .. "/derr") or ""
+if derr ~= "" then io.stderr:write("----- daemon stderr -----\n" .. derr .. "-------------------------\n") end
+sh.execute("rm -rf '" .. run .. "' 2>/dev/null")
+sh.cleanup()
+if not okrun then io.stderr:write("service mode test crashed: " .. tostring(err) .. "\n"); os.exit(1) end
+if fails > 0 then io.stderr:write(fails .. " of " .. tests .. " service mode tests failed!\n"); os.exit(1) end
+io.write("All " .. tests .. " service mode tests passed!\n")

@@ -23,7 +23,7 @@ local function show_help()
 uuidv7 - Generate RFC 9562 compliant UUIDv7 (time-ordered, strictly monotonic)
 
 Usage: uuidv7 [options] [nanoseconds-from-epoch]
-       uuidv7 --daemon
+       uuidv7 --daemon [--service]
 
 Options:
   --hyphen, --hyphens, -      Output with hyphens
@@ -31,6 +31,8 @@ Options:
   --about, -a                 Show a brief description
   --test                      Run the test suite
   --daemon                    Run as a Unix-socket daemon (see below)
+  --daemon --service          ... as the machine-wide service: refuses l, r and +++
+                              (the service manager stops and restarts it)
   --api, --raw, --socket-api  Send a raw protocol line to a running daemon, print reply
                               e.g. uuidv7 --api c5  (5 uuids)   uuidv7 --api s  (status)
   --extract-timestamp <uuid>  Recover the epoch timestamp encoded in a UUIDv7
@@ -64,6 +66,7 @@ Daemon:
     tn<ns> / tm<ms> explicit time    * ephemeral (requires tn/tm)
     R<n> / W<us> client retry telemetry (attempt #, microseconds waited; logged)
     PING  s=status  sj=status(JSON)  l=log-stats  r=restart  +++=shutdown  h or ?
+  Under systemd socket activation (LISTEN_FDS) the daemon adopts the socket.
   When a daemon is reachable the CLI gets its UUID from it and NEVER silently
   generates locally (that uses a separate counter and could break monotonicity):
   it retries with tiny exponential backoff, then errors. Tune/disable via env.
@@ -88,7 +91,15 @@ end
 -- Main
 local function main(args)
 	if args[1] == "--daemon" then
-		require("uuidv7_daemon").run({ arg0 = arg and arg[0] })
+		local dopts = { arg0 = arg and arg[0] }
+		for i = 2, #args do
+			if args[i] == "--service" then dopts.service = true
+			else
+				io.stderr:write("uuidv7: unknown --daemon option: " .. args[i] .. " (only --service)\n")
+				os.exit(2)
+			end
+		end
+		require("uuidv7_daemon").run(dopts)
 		return
 	end
 	if args[1] == "--api" or args[1] == "--raw" or args[1] == "--socket-api" then

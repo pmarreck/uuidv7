@@ -182,6 +182,13 @@ please try again", and later ones exit 1 saying the service is not running. The 
 kept in the per-user state directory and resets when the service answers again.
 Concurrent refused requests can each read the same count, so it is approximate.
 
+The system service runs as `uuidv7 --daemon --service`. Its socket is open to every
+local user, so in service mode the daemon answers `+++` (shut down), `r` (restart) and `l`
+(log stats) with `ERR` and leaves stopping and restarting to the service manager; status
+(`s`, `sj`) and everything else work as usual. Under systemd socket activation
+(`LISTEN_FDS`/`LISTEN_PID`) the daemon adopts the socket systemd hands it and leaves the
+socket file in place when it stops.
+
 It's a line-based protocol (newline-terminated, no spaces), so it's `nc -U`-friendly:
 
 ```
@@ -235,6 +242,28 @@ nix profile install github:pmarreck/uuidv7
 
 Put `bin/` on your `PATH`. Requires `luajit` on your `PATH`.
 
+### Machine-wide service (Linux, systemd)
+
+Nothing is installed automatically. On NixOS, import the flake's module and enable it:
+
+```nix
+{
+  imports = [ uuidv7.nixosModules.default ];
+  services.uuidv7.enable = true;
+}
+```
+
+Elsewhere, copy `contrib/systemd/uuidv7.socket` and `uuidv7.service` to
+`/etc/systemd/system/` (edit `ExecStart` if `uuidv7` is not in `/usr/local/bin`) and run
+`systemctl enable --now uuidv7.socket`. systemd creates the root-owned `/run/uuidv7/`
+with a socket every user can reach, and starts the service on the first request. The
+service runs as a dynamic user with its counter in `/run/private/uuidv7-state` (RAM, kept
+until reboot). systemd restarts a crashed service up to 3 times a minute; past that it
+stays failed until an administrator runs `systemctl reset-failed uuidv7.service
+uuidv7.socket` and starts the socket again. `nix build .#checks.x86_64-linux.service-vm`
+boots a NixOS VM (needs KVM) and checks all of this with two users. The macOS (launchd) and
+Windows services are not built yet.
+
 ## Development
 
 ```sh
@@ -286,6 +315,9 @@ tests/uuidv7z_cli_test                        uuidv7z CLI vs the LuaJIT CLI
 tests/uuidv7z_daemon_test                     uuidv7z as a daemon client (real daemon + refusing stub)
 tests/uuidv7_stub_daemon.lua                  stub daemon with a fixed reply, for client tests
 tests/uuidv7_testsh.lua                       runs the suites' POSIX command lines on every OS
+tests/uuidv7_service_mode_test                --service refusals and systemd socket activation
+contrib/systemd/uuidv7.{socket,service}       machine-wide service units
+nix/module.nix, nix/service_vm_test.nix       NixOS module and its VM test
 alternates/uuidv7.{bash,sh}                   pure-bash / POSIX-sh references (not installed)
 src/uuidv7.zig              pure Zig core (port of lib/uuidv7_core.lua)
 src/ffi.zig, include/uuidv7.h   C ABI

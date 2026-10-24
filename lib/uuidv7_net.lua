@@ -41,6 +41,7 @@ local function posix()
 		uuidv7_sighandler_t signal(int signum, uuidv7_sighandler_t handler);
 		int execv(const char *path, char *const argv[]);
 		int setenv(const char *name, const char *value, int overwrite);
+		int unsetenv(const char *name);
 		int getpid(void);
 		int chmod(const char *path, mode_t mode);
 		int getpeereid(int sockfd, uid_t *euid, gid_t *egid);
@@ -144,6 +145,16 @@ local function posix()
 		return ok and uid or nil
 	end
 	function M.getpid() return tonumber(C.getpid()) end
+	-- systemd socket activation (sd_listen_fds protocol): when LISTEN_PID names this
+	-- process and LISTEN_FDS >= 1, the listener is fd 3 (SD_LISTEN_FDS_START). The
+	-- variables are cleared so no child process mistakes them for its own.
+	function M.systemd_listen_fd()
+		local pid, n = tonumber(os.getenv("LISTEN_PID")), tonumber(os.getenv("LISTEN_FDS"))
+		if pid ~= M.getpid() or not n or n < 1 then return nil end
+		for _, v in ipairs({ "LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES" }) do C.unsetenv(v) end
+		C.fcntl(3, F_SETFD, ffi.new("int", 1))   -- close-on-exec, like a listener we bound
+		return M.adopt(3)
+	end
 	-- SIGINT/SIGTERM set stop[0]; SIGPIPE is ignored so a vanished client cannot kill us.
 	function M.install_stop_signals(stop)
 		local function on_signal() stop[0] = 1 end
@@ -284,6 +295,7 @@ local function windows()
 	end
 	function M.peer_uid() return nil end
 	function M.getpid() return tonumber(C.GetCurrentProcessId()) end
+	function M.systemd_listen_fd() return nil end   -- systemd is Linux-only
 	-- Console control events arrive on another thread, which a LuaJIT callback cannot
 	-- safely serve, so Ctrl-C keeps its default effect (end the process). The next
 	-- start removes a stale socket file before binding.

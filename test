@@ -55,6 +55,7 @@ fi
 "$here/tests/uuidv7z_daemon_test" || rc=$?   # uuidv7z as a daemon client (real + refusing stub)
 "$here/tests/uuidv7_daemon_persist_test" || rc=$?   # daemon counter is the write-through state file (seed, sharing, hard kill)
 "$here/tests/uuidv7_system_socket_test" || rc=$?   # discovery order, system-socket trust, refused-service policy (both CLIs)
+"$here/tests/uuidv7_service_mode_test" || rc=$?   # --service refuses control commands; systemd socket activation
 "$here/tests/uuidv7_fallback_test" || rc=$?   # daemon retry / no-silent-fallback policy
 "$here/tests/uuidv7_load_test"    || rc=$?   # concurrency invariants under load (no perf gating)
 "$here/tests/uuidv7_fuzz_test"    || rc=$?   # hostile/malformed protocol input (robustness)

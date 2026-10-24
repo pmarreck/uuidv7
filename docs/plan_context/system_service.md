@@ -17,7 +17,7 @@ and macOS lacks robust process-shared mutexes.
 | Socket | `/run/uuidv7/uuidv7.sock` | `/var/run/uuidv7/uuidv7.sock` | `%ProgramData%\uuidv7\uuidv7.sock` |
 | Activation | `uuidv7.socket` unit (`SocketMode=0666`), daemon adopts the fd via `LISTEN_FDS` | `LaunchDaemon` plist with a `Sockets` entry (`SockPathMode` 0666), daemon calls `launch_activate_socket` | a small C service host registered with the SCM that runs the daemon (LuaJIT cannot be an SCM service itself) |
 | Account | `DynamicUser=yes` | `nobody` | `LocalService` |
-| State across restarts | `/run/uuidv7/sequence`, `RuntimeDirectoryPreserve=yes` | `/private/tmp/uuidv7-<service uid>/sequence` by default, configurable with `UUIDV7_STATE_DIR` in the plist | `%ProgramData%\uuidv7\sequence` |
+| State across restarts | `/run/private/uuidv7-state/sequence` (`RuntimeDirectory=uuidv7-state`, `RuntimeDirectoryPreserve=yes`) | `/private/tmp/uuidv7-<service uid>/sequence` by default, configurable with `UUIDV7_STATE_DIR` in the plist | `%ProgramData%\uuidv7\sequence` |
 
 Any local user may request IDs (socket mode 0666). Allocation reveals nothing,
 so the only exposure is flooding, which the existing per-request caps bound.
@@ -95,6 +95,21 @@ socket; service mode (`--daemon --service`, set by the unit file, plist or
 Windows service host) answers them with `ERR` and serves everything else.
 Service mode is an explicit flag rather than inferred from `LISTEN_FDS`, so the
 refusal does not depend on how the socket was created.
+
+Phase 3 done (2026-10-23): `--daemon --service` refuses `+++`, `r` and `l`
+(`tests/uuidv7_service_mode_test`), the daemon adopts a systemd-activated socket
+(tested with `systemd-socket-activate`), `contrib/systemd/` holds the units, the
+package installs them under `lib/systemd/system`, and `nixosModules.default`
+enables them. `checks.x86_64-linux.service-vm` boots a NixOS VM and checks socket
+ownership and modes, two users sharing the service, the refused control commands,
+a crash restart, and the 75/75/75/1 client policy once systemd's start limit is
+hit. Found there: with `DynamicUser`, systemd puts a preserved runtime directory
+at `/run/private/uuidv7-state` and links `/run/uuidv7-state` to it; the daemon
+refuses a symlinked state directory and silently used an in-memory counter
+until `UUIDV7_STATE_DIR` named the real path. That silent fallback is the open
+unusable-state-file policy. The service log is `/dev/null`, since any local user
+can make the daemon log an event and `/run` is RAM. Not done: verification on a
+real (non-VM) Linux host.
 
 ## Install
 

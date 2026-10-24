@@ -7,7 +7,10 @@
   };
 
   outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
+    {
+      # services.uuidv7.enable = true runs the machine-wide service (Linux, systemd).
+      nixosModules.default = import ./nix/module.nix { inherit self; };
+    } // flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
@@ -35,6 +38,11 @@
             patchShebangs $out/bin/uuidv7
             # The CLI, client, and daemon all require modules from $out/lib.
             wrapProgram $out/bin/uuidv7 --set LUA_PATH "$out/lib/?.lua;;"
+            # systemd units for the machine-wide service (used by nixosModules.default).
+            mkdir -p $out/lib/systemd/system
+            cp contrib/systemd/uuidv7.socket contrib/systemd/uuidv7.service $out/lib/systemd/system/
+            substituteInPlace $out/lib/systemd/system/uuidv7.service \
+              --replace-fail /usr/local/bin/uuidv7 $out/bin/uuidv7
             runHook postInstall
           '';
           meta = with pkgs.lib; {
@@ -84,7 +92,8 @@
         # the full suite INCLUDING the daemon black-box test, so cross-platform breakage
         # (sockaddr_un, O_NONBLOCK, accept() flag inheritance, etc.) is caught here.
         checks.uuidv7-test = pkgs.runCommand "uuidv7-test"
-          { nativeBuildInputs = runtimeTools ++ testTools ++ [ zig pkgs.file ]; } ''
+          { nativeBuildInputs = runtimeTools ++ testTools ++ [ zig pkgs.file ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.systemd ]; } ''
             cp -r ${./.} work
             chmod -R u+w work
             cd work
@@ -101,7 +110,9 @@
           '';
 
         devShells.default = pkgs.mkShell {
-          packages = runtimeTools ++ testTools ++ [ zig pkgs.file ];
+          # systemd-socket-activate drives the socket-activation suite on Linux.
+          packages = runtimeTools ++ testTools ++ [ zig pkgs.file ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.systemd ];
         };
       } (pkgs.lib.optionalAttrs (system == "x86_64-linux") {
         # The Windows toolchain for real-host test runs (./test-windows): a static
@@ -127,5 +138,7 @@
             [ "$dlls" = "kernel32.dll msvcrt.dll " ] || { echo "unexpected DLL imports"; exit 1; }
             touch $out
           '';
+        # A NixOS VM with services.uuidv7 enabled (needs KVM on the builder).
+        checks.service-vm = import ./nix/service_vm_test.nix { inherit self pkgs; };
       }));
 }

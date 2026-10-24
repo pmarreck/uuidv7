@@ -1,0 +1,35 @@
+# Machine-wide uuidv7 service, started on demand by uuidv7.socket. Edit
+# ExecStart if uuidv7 is installed somewhere other than /usr/local/bin.
+#
+# The counter state lives in RAM in the runtime directory uuidv7-state, owned
+# by the service's dynamic user and kept until reboot, separate from the
+# root-owned socket directory. With DynamicUser, systemd creates it as
+# /run/private/uuidv7-state and links /run/uuidv7-state to it; the daemon
+# refuses a symlinked state directory, so UUIDV7_STATE_DIR names the real one. systemd restarts a crashed service up to 3 times within the start
+# limit interval; after that it stays failed and clients report an error.
+[Unit]
+Description=uuidv7 machine-wide UUIDv7 service
+Requires=uuidv7.socket
+After=uuidv7.socket
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+ExecStart=/usr/local/bin/uuidv7 --daemon --service
+Environment=UUIDV7_SOCK=/run/uuidv7/uuidv7.sock
+Environment=UUIDV7_STATE_DIR=/run/private/uuidv7-state
+# No log file: every local user can make the daemon log an event (a malformed
+# request, a refused control command), and /run is RAM.
+Environment=UUIDV7_LOG=/dev/null
+Restart=always
+RestartSec=100ms
+DynamicUser=yes
+RuntimeDirectory=uuidv7-state
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX
