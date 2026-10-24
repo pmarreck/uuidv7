@@ -14,7 +14,7 @@ Open work in priority order. Completed items: [docs/PLAN_LOG.md](docs/PLAN_LOG.m
 	- [x] Daemon persistence: write the per-user state file on every allocation (RAM) and seed from it at start; measure the cost (phase 1, context: docs/plan_context/system_service.md) (done 2026-10-21 15:05 EDT)
 - [ ] System service, layered default (BDFN 2026-10-19): plan approved 2026-10-21 (context: docs/plan_context/system_service.md)
 	- [x] Phase 2: client discovery order, system-socket trust check and refused-service policy (exit 75 x3, then 1) in uuidv7 and uuidv7z (done 2026-10-23 14:40 EDT)
-	- [ ] Phase 3: systemd socket activation, unit files, NixOS module; the service must refuse control commands (+++, r, l) from clients
+	- [ ] Phase 3: systemd socket activation, unit files, NixOS module; a service mode (`--daemon --service`) that refuses control commands (+++, r, l) while the per-user daemon keeps them (context: docs/plan_context/system_service.md)
 	- [ ] Phase 4: launchd socket activation and plist (real-host sudo needs approval)
 	- [ ] Phase 5: Windows service host (install on the test host needs approval)
 	- [x] Decided: refused system socket -> service restarted up to N times with a try-again message, then an error; macOS state in /private/tmp by default, configurable (done 2026-10-21 14:46 EDT)

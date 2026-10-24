@@ -89,7 +89,12 @@ current-user owner is exercised there.
 Needed before any service ships (phase 3): the daemon accepts control
 commands (`+++`, `r`, `l`) from anyone who can connect. With a socket every
 local user can reach, the service must refuse them and leave stop/restart to
-the service manager.
+the service manager. BDFN chose two modes (2026-10-23): the per-user daemon
+(`--daemon`) keeps the control commands, since only its owner can reach its
+socket; service mode (`--daemon --service`, set by the unit file, plist or
+Windows service host) answers them with `ERR` and serves everything else.
+Service mode is an explicit flag rather than inferred from `LISTEN_FDS`, so the
+refusal does not depend on how the socket was created.
 
 ## Install
 
