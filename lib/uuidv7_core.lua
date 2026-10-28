@@ -438,36 +438,31 @@ function M.trusted_socket(path)
 	return true
 end
 
--- The warning for a counter that cannot use its state file (no state directory,
--- one that is not private or is a symlink, or a symlinked sequence file). Values
--- from such a process are not ordered with any other process's, so this is never
--- silent. uuidv7z prints the same text.
-function M.unusable_state_warning(prog, dir)
-	if not dir then
-		return prog .. ": warning: no counter state directory found (set UUIDV7_STATE_DIR); " ..
-			"this process uses its own counter, so its UUIDs are not ordered with other processes'\n"
-	end
-	return prog .. ": warning: cannot use the counter state in " .. dir ..
-		" (it must be a private directory owned by this user, with no symlinks); " ..
-		"this process uses its own counter, so its UUIDs are not ordered with other processes'\n"
+-- Why a counter cannot use its state file (no state directory, one that is not
+-- private or is a symlink, or a symlinked sequence file). A UUID from a counter
+-- of the process's own would not be ordered with other processes' UUIDs, so none
+-- is generated: ordering is the promise. uuidv7z prints the same text.
+function M.unusable_state_error(dir)
+	local why = dir and ("cannot use the counter state in " .. dir ..
+		" (it must be a private directory owned by this user, with no symlinks)")
+		or "no counter state directory found (set UUIDV7_STATE_DIR)"
+	return why .. "; no UUID generated, since it would not be ordered with other processes' UUIDs"
 end
 
--- Report a switch to this process's own counter once per switch, not per value:
--- the warning repeats only after the state file has been usable again.
--- `on_unusable(message)` overrides where it goes (the daemon also logs it).
+-- Tell an optional `on_unusable(message)` hook (the daemon's) when the state file
+-- becomes unusable: once per switch, not per request.
 local function note_state(self, usable)
-	if usable then self._fallback = false; return end
-	if self._fallback then return end
-	self._fallback = true
-	local msg = M.unusable_state_warning("uuidv7", self.dir)
-	if self.on_unusable then self.on_unusable(msg) else io.stderr:write(msg); io.stderr:flush() end
+	if usable then self._unusable = false; return end
+	if self._unusable then return end
+	self._unusable = true
+	if self.on_unusable then self.on_unusable(M.unusable_state_error(self.dir)) end
 end
 
 -- Filesystem (Linux and macOS CLI default): flock'd file in the state directory, atomic cross-process RMW.
 local FsCounter = {}
 FsCounter.__index = FsCounter
 function FsCounter:new()
-	return setmetatable({ dir = M.state_dir(), _nt = nil, _ctr = nil }, self)
+	return setmetatable({ dir = M.state_dir() }, self)
 end
 -- Parse the "ns:counter" state text into (int64, uint64), or nil for empty/garbled.
 local function parse_state(s)
@@ -479,7 +474,7 @@ end
 -- Run fn(mem) under the file lock, where mem is a MemoryCounter seeded from the
 -- stored state; the state mem ends in is written back once before unlocking. One
 -- locked read-modify-write then covers a whole batch. Without a usable file, fn
--- runs against this process's own state.
+-- does not run and the result is nil, reason.
 function FsCounter:locked(fn)
 	local fd = -1
 	local dfd = self.dir and M.open_private_dir(self.dir)
@@ -489,12 +484,7 @@ function FsCounter:locked(fn)
 	end
 	local mem = MemoryCounter:new()
 	note_state(self, fd >= 0)
-	if fd < 0 then
-		mem._nt, mem._ctr = self._nt, self._ctr
-		local r = { fn(mem) }
-		self._nt, self._ctr = mem._nt, mem._ctr
-		return unpack(r)
-	end
+	if fd < 0 then return nil, M.unusable_state_error(self.dir) end
 	C.flock(fd, C.LOCK_EX)
 	C.lseek(fd, 0, C.SEEK_SET)
 	local buf = ffi.new("char[?]", 96)
@@ -515,7 +505,7 @@ end
 local WinCounter = {}
 WinCounter.__index = WinCounter
 function WinCounter:new()
-	return setmetatable({ dir = M.state_dir(), filepath = M.state_file("sequence"), _nt = nil, _ctr = nil }, self)
+	return setmetatable({ dir = M.state_dir(), filepath = M.state_file("sequence") }, self)
 end
 function WinCounter:locked(fn)
 	local GENERIC_RW, SHARE_RW, OPEN_ALWAYS, LOCKFILE_EXCLUSIVE = 0xC0000000, 3, 4, 2
@@ -533,12 +523,7 @@ function WinCounter:locked(fn)
 	end
 	local mem = MemoryCounter:new()
 	note_state(self, h ~= nil)
-	if h == nil then
-		mem._nt, mem._ctr = self._nt, self._ctr
-		local r = { fn(mem) }
-		self._nt, self._ctr = mem._nt, mem._ctr
-		return unpack(r)
-	end
+	if h == nil then return nil, M.unusable_state_error(self.dir) end
 	local ov = ffi.new("uuidv7_OVERLAPPED")
 	C.LockFileEx(h, LOCKFILE_EXCLUSIVE, 0, 0xFFFFFFFF, 0xFFFFFFFF, ov)
 	local buf = ffi.new("char[?]", 96)
@@ -607,11 +592,12 @@ local function encode_bytes(eff, ctr)
 end
 M.encode_bytes = encode_bytes
 
--- Build the 16 UUID bytes for one value. Returns (bytes, kind).
+-- Build the 16 UUID bytes for one value. Returns (bytes, kind), or nil, reason.
 local function generate_bytes(counter, static_nanotime, clock, random_u64)
 	local is_static = static_nanotime ~= nil
 	local current = static_nanotime or (clock or get_nanotime)()
 	local eff, ctr, kind = counter:get_next(current, is_static, random_u64)
+	if eff == nil then return nil, ctr end   -- unusable state file: ctr is the reason
 	return encode_bytes(eff, ctr), kind
 end
 M.generate_bytes = generate_bytes
@@ -680,20 +666,23 @@ local function extract_timestamp(uuid, unit)
 end
 M.extract_timestamp = extract_timestamp
 
--- High-level: generate `count` formatted UUID strings. Returns (lines, kind_counts).
+-- High-level: generate `count` formatted UUID strings. Returns (lines, kind_counts),
+-- or nil, reason when the counter's state file is unusable.
 -- opts = { time=int64|nil, hyphens=bool, count=int }
 function M.generate(counter, opts)
 	opts = opts or {}
 	local count = opts.count or 1
 	local lines = {}
 	local kinds = { new = 0, same_ns = 0, rollback = 0, ts_ahead = 0 }
-	counter:locked(function(c)
+	local done, why = counter:locked(function(c)
 		for i = 1, count do
 			local b, kind = generate_bytes(c, opts.time)
 			lines[i] = format_uuid(b, opts.hyphens)
 			kinds[kind] = (kinds[kind] or 0) + 1
 		end
+		return true
 	end)
+	if not done then return nil, why end
 	return lines, kinds
 end
 

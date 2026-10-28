@@ -61,7 +61,7 @@ local function is_uuid_line(out) return out:match("^%x+\n$") ~= nil and #out == 
 -- Daemons: the per-user one in `state`, the "system" one at `sysdir` with its own state.
 local daemons = {}
 local function start_daemon(key, sock, sdir)
-	local h = sh.popen(string.format("env UUIDV7_SOCK=%q UUIDV7_STATE_DIR=%q UUIDV7_LOG=%q LUA_PATH=%q UUIDV7_SILENCE_INSECURE_RANDOM=1 %q --daemon 2>>%q",
+	local h = sh.popen(string.format("exec env UUIDV7_SOCK=%q UUIDV7_STATE_DIR=%q UUIDV7_LOG=%q LUA_PATH=%q UUIDV7_SILENCE_INSECURE_RANDOM=1 %q --daemon 2>>%q",
 		sock, sdir, run .. "/" .. key .. ".log", libp, exe, run .. "/derr"), "r")
 	local up = wait_for(h, "UUIDV7-LISTENING")
 	daemons[key] = { h = h, sock = sock, pid = (client.oneshot(sock, "sj") or ""):match('"pid":(%d+)') }

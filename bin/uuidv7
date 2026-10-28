@@ -13,8 +13,11 @@ local core = require("uuidv7_core")
 local counter = core.new_counter("auto")
 local parse_static = core.parse_static
 local format_uuid = core.format_uuid
+-- 16 UUID bytes, or exit 1 when the counter state file is unusable.
 local function generate_uuidv7(static_nanotime)
-	return (core.generate_bytes(counter, static_nanotime))
+	local b, why = core.generate_bytes(counter, static_nanotime)
+	if not b then io.stderr:write("uuidv7: error: " .. why .. "\n"); os.exit(1) end
+	return b
 end
 
 -- Show help

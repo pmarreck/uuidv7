@@ -188,6 +188,7 @@ local function do_generate(req)
 		counter, time = server.counter, nil
 	end
 	local lines, kinds = core.generate(counter, { time = time, hyphens = req.hyphens, count = req.count })
+	if not lines then return nil, kinds end
 	if not req.ephemeral then
 		server.k_same_ns = server.k_same_ns + (kinds.same_ns or 0)
 		server.k_rollback = server.k_rollback + (kinds.rollback or 0)
@@ -381,15 +382,15 @@ function M.run(opts)
 	}
 	server.start_iso = (now_parts())
 	server.logfh = open_logfh()
-	-- An unusable state file goes to stderr (the journal, under a service manager)
-	-- and the log. Touching the counter once now reports it at start rather than
-	-- at the first request.
-	server.counter.on_unusable = function(msg)
-		io.stderr:write(msg); io.stderr:flush()   -- Windows buffers a redirected stderr
-		log_event("warning", { reason = "counter state unusable; serving from this process's own counter",
-			state_dir = server.counter.dir })
+	-- A UUID the state file cannot order is never served: an unusable state file
+	-- stops the daemon from starting, and later makes requests fail with ERR. Each
+	-- switch to unusable goes to stderr (the journal, under a service manager) and
+	-- the log.
+	server.counter.on_unusable = function(why)
+		io.stderr:write("uuidv7: error: " .. why .. "\n"); io.stderr:flush()   -- Windows buffers a redirected stderr
+		log_event("error", { reason = why, state_dir = server.counter.dir })
 	end
-	server.counter:locked(function() end)
+	if not server.counter:locked(function() return true end) then os.exit(1) end
 
 	local listen_fd, adopted = make_listener()
 	server.listen_fd = listen_fd

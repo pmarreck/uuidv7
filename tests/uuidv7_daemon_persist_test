@@ -39,7 +39,7 @@ local function read_seq() local f = io.open(seqf, "rb"); if not f then return ni
 
 local dh
 local function start_daemon()
-	dh = sh.popen(env .. " " .. string.format("%q", exe) .. " --daemon 2>" .. string.format("%q", run .. "/derr"), "r")
+	dh = sh.popen("exec " .. env .. " " .. string.format("%q", exe) .. " --daemon 2>" .. string.format("%q", run .. "/derr"), "r")
 	while true do
 		local l = dh:read("*l")
 		if not l then return false end

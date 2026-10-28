@@ -211,24 +211,22 @@ static int create_state_file(int dfd, const char *name) {
 
 /* ---- counter state: one exclusively locked file shared by all processes ---- */
 
-/* Values from a process without the shared state file are not ordered with any
- * other process's, so falling back is never silent: one warning per process,
- * the same text as the LuaJIT CLI. */
-static void warn_unusable_state(const char *dir) {
-	static int warned;
-	if (warned) return;
-	warned = 1;
+/* A UUID from a counter of this process's own would not be ordered with other
+ * processes' UUIDs, so without the shared state file none is generated: exit 1
+ * with the same text as the LuaJIT CLI. */
+static _Noreturn void die_unusable_state(const char *dir) {
 	if (!dir)
-		fputs(PROG ": warning: no counter state directory found (set UUIDV7_STATE_DIR); "
-			"this process uses its own counter, so its UUIDs are not ordered with other processes'\n", stderr);
+		fputs(PROG ": error: no counter state directory found (set UUIDV7_STATE_DIR); "
+			"no UUID generated, since it would not be ordered with other processes' UUIDs\n", stderr);
 	else
-		fprintf(stderr, PROG ": warning: cannot use the counter state in %s (it must be a private directory "
-			"owned by this user, with no symlinks); this process uses its own counter, so its UUIDs are "
-			"not ordered with other processes'\n", dir);
+		fprintf(stderr, PROG ": error: cannot use the counter state in %s (it must be a private directory "
+			"owned by this user, with no symlinks); no UUID generated, since it would not be ordered "
+			"with other processes' UUIDs\n", dir);
+	exit(1);
 }
 
 /* Read-modify-write of the stored state under an exclusive lock. Without a
- * usable state file, warns and falls back to this process's own (empty) state. */
+ * usable state file, exits 1 (die_unusable_state). */
 static uuidv7_state next_state(int64_t current, int is_static) {
 	uuidv7_state stored, out;
 	uint8_t kind, used;
@@ -299,10 +297,7 @@ static uuidv7_state next_state(int64_t current, int is_static) {
 		close(fd);
 	}
 #endif
-	warn_unusable_state(dir);
-	free(dir);
-	uuidv7_advance(NULL, current, is_static, seed, &out, &kind, &used);
-	return out;
+	die_unusable_state(dir);
 }
 
 /* ---- output ---- */

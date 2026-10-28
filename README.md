@@ -52,12 +52,11 @@ remain strictly ordered and unique.
   `FILE_ATTRIBUTE_TEMPORARY` so the cache manager keeps it in memory. The state does not
   survive a reboot; ordering across one relies on the clock. Because `/tmp` is shared,
   the directory is created 0700 and used only if it is a real directory (not a symlink)
-  owned by the user with no group or other access. Otherwise the CLIs and the daemon
-  fall back to a per-process counter and print a warning on stderr
-  (`warning: cannot use the counter state in <dir> ...`), because their values are then
-  not ordered with other processes'; the daemon also logs it and warns when it starts, so
-  a misconfigured service shows it in its journal. The daemon also refuses to put its
-  default socket in such a directory. Ordering is per user:
+  owned by the user with no group or other access. Otherwise nothing hands out a UUID,
+  because one from a counter of its own would not be ordered with other processes'
+  UUIDs: the CLIs exit 1 (`error: cannot use the counter state in <dir> ...`), the daemon
+  refuses to start (so a misconfigured service fails, with the reason in its journal),
+  and a running daemon answers `ERR` until the state file is usable again. Ordering is per user:
   different accounts keep separate counters. A service with a private `/tmp` (systemd
   `PrivateTmp=`) sees a different directory.
 - `UUIDV7_STATE_DIR` — use this directory instead (tests, deliberate isolation).

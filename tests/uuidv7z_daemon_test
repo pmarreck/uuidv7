@@ -50,7 +50,7 @@ local env_d = string.format("UUIDV7_SOCK=%q LUA_PATH=%q UUIDV7_SILENCE_INSECURE_
 -- ---------- real daemon ----------
 local dh, pid, stopped
 local function real_daemon()
-	dh = sh.popen(string.format("env %s UUIDV7_LOG=%q %q --daemon 2>%q", env_d, run .. "/d.log", exe, run .. "/derr"), "r")
+	dh = sh.popen(string.format("exec env %s UUIDV7_LOG=%q %q --daemon 2>%q", env_d, run .. "/d.log", exe, run .. "/derr"), "r")
 	ok("daemon announces listening", wait_for(dh, "UUIDV7-LISTENING"))
 	pid = (client.oneshot(sock, "sj") or ""):match('"pid":(%d+)')
 
@@ -96,7 +96,7 @@ end
 local sth, stub_stopped
 local function refusing_daemon()
 	local rec = run .. "/requests"
-	sth = sh.popen(string.format("luajit %q %q %q %q", self_dir .. "/uuidv7_stub_daemon.lua", sock, "ERR busy\\n", rec), "r")
+	sth = sh.popen(string.format("exec luajit %q %q %q %q", self_dir .. "/uuidv7_stub_daemon.lua", sock, "ERR busy\\n", rec), "r")
 	ok("stub daemon announces listening", wait_for(sth, "STUB-LISTENING"))
 
 	local out, err, rc = cli(env_d .. " UUIDV7_DAEMON_RETRIES=3", zcli, "--hyphen")

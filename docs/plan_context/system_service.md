@@ -106,13 +106,14 @@ a crash restart, and the 75/75/75/1 client policy once systemd's start limit is
 hit. Found there: with `DynamicUser`, systemd puts a preserved runtime directory
 at `/run/private/uuidv7-state` and links `/run/uuidv7-state` to it; the daemon
 refuses a symlinked state directory and silently used an in-memory counter
-until `UUIDV7_STATE_DIR` named the real path. BDFN decided (2026-10-28) that the
-fallback must never be silent: the daemon and both CLIs now warn on stderr, the
-daemon also logs a `warning` event and checks the state file when it starts, so a
-misconfigured service warns in its journal before the first request
-(`tests/uuidv7_service_mode_test`, `tests/uuidv7_state_dir_test`), and the VM test
-asserts the journal has no such warning. Whether service mode should refuse to
-start instead is still open. The service log is `/dev/null`, since any local user
+until `UUIDV7_STATE_DIR` named the real path. BDFN decided (2026-10-28) that no UUID is
+handed out without the ordering guarantee: a daemon that cannot use its state file
+refuses to start (exit 1, the reason on stderr, which is the journal, and in its
+log), a running daemon answers `ERR` while the file is unusable, and both CLIs exit
+1 (`tests/uuidv7_service_mode_test`, `tests/uuidv7_state_dir_test`). The VM test
+checks the shipped unit's journal has no such error, and that with the symlinked
+state directory the service fails and clients get no UUIDs (exit 75 while systemd
+gives up, then 1). The service log is `/dev/null`, since any local user
 can make the daemon log an event and `/run` is RAM. Not done: verification on a
 real (non-VM) Linux host.
 

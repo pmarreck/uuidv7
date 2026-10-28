@@ -36,3 +36,5 @@ Completed PLAN.md items retired by plan-retire, oldest retirement first.
 
 - [x] [Next (authorized, unblocked) › Counter/daemon scope audit (Turing request 2026-10-14): stat…] Fix: state file written through a planted symlink (O_NOFOLLOW in both CLIs, tests/uuidv7_state_safety_test) (done 2026-10-14 19:21 EDT, 7746c5a)
 - [x] [Next (authorized, unblocked) › Counter/daemon scope audit (Turing request 2026-10-14): stat…] Measure the boundaries: differing TMPDIR 20/40 out of order, nix develop sets a per-shell TMPDIR, unusable file falls back silently, socket uses a different lookup (done 2026-10-14 19:25 EDT)
+- [x] [Next (authorized, unblocked) › Counter/daemon scope audit (Turing request 2026-10-14): stat…] Per-user state directory at a fixed RAM-backed path (/tmp/uuidv7-<uid>, verified 0700 and owned; Local AppData\Temp\uuidv7 with FILE_ATTRIBUTE_TEMPORARY on Windows), UUIDV7_STATE_DIR override; counter file and default socket both there (done 2026-10-19 19:58 EDT)
+- [x] [Awaiting BDFN decisions (queued in the walking brief)] Decision uuidv7-counter-scope: BDFN chose per user now, cross-user later (terminal answer, 2026-10-15 12:50 EDT)

@@ -5,7 +5,8 @@
 # services): /tmp/uuidv7-<uid> on Linux and macOS,
 # <Local AppData>\Temp\uuidv7 on Windows. UUIDV7_STATE_DIR overrides it. In a
 # shared directory it is used only if it is a real directory, owned by the user,
-# with mode 0700. Otherwise the CLI keeps its own counter and says so on stderr.
+# with mode 0700. Otherwise the CLI generates nothing and exits 1: a UUID from a
+# counter of its own would not be ordered with other processes' UUIDs.
 set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export UUIDV7_NO_DAEMON=1 UUIDV7_SILENCE_INSECURE_RANDOM=1
@@ -57,14 +58,25 @@ if [ "$is_windows" -eq 0 ]; then
 		open_dir="$T/$impl-open"; mkdir -p "$open_dir"; chmod 0777 "$open_dir"
 		out="$(UUIDV7_STATE_DIR="$open_dir" "${run[@]}" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
 		check "$impl: a group/world-writable state directory is not used" '[ ! -e "$open_dir/sequence" ]'
-		check "$impl: ... and generation still succeeds" '[ "$rc" -eq 0 ] && [[ "$out" =~ ^[0-9a-f]{32}$ ]]'
-		check "$impl: ... with one warning naming the directory" '[[ "$err" == *"warning: cannot use the counter state in $open_dir"* ]] && [ "$(grep -c warning <<<"$err")" -eq 1 ]'
+		check "$impl: ... and no UUID is generated (exit 1)" '[ "$rc" -eq 1 ] && [ -z "$out" ]'
+		check "$impl: ... with one error naming the directory" '[[ "$err" == *"error: cannot use the counter state in $open_dir"* ]] && [ "$(grep -c error <<<"$err")" -eq 1 ]'
 		real="$T/$impl-real"; mkdir -p "$real"; chmod 0700 "$real"; ln -s "$real" "$T/$impl-link"
-		err="$(UUIDV7_STATE_DIR="$T/$impl-link" "${run[@]}" 2>&1 >/dev/null)"
+		out="$(UUIDV7_STATE_DIR="$T/$impl-link" "${run[@]}" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
 		check "$impl: a symlinked state directory is not followed" '[ ! -e "$real/sequence" ]'
-		check "$impl: ... with a warning naming the directory" '[[ "$err" == *"warning: cannot use the counter state in $T/$impl-link"* ]]'
+		check "$impl: ... and no UUID is generated (exit 1), naming the directory" '[ "$rc" -eq 1 ] && [ -z "$out" ] && [[ "$err" == *"error: cannot use the counter state in $T/$impl-link"* ]]'
 	done
 fi
+
+# ---- a state directory that cannot be created (every OS) ----
+printf x > "$T/blocker"
+# Git Bash cannot translate a path through a regular file, so a native program
+# would get "/tmp/..." untranslated (the current drive's \tmp): pass Windows form.
+bad="$T/blocker/state"; [ "$is_windows" -eq 1 ] && bad="$(cygpath -m "$T")/blocker/state"
+for impl in lua zig; do
+	if [ "$impl" = lua ]; then run=("${lua[@]}"); else run=("$zig"); fi
+	out="$(UUIDV7_STATE_DIR="$bad" "${run[@]}" "$S" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
+	check "$impl: a state directory that cannot be created: no UUID (exit 1), with an error" '[ "$rc" -eq 1 ] && [ -z "$out" ] && [[ "$err" == *"error: cannot use the counter state in "*"blocker"* ]]'
+done
 
 # ---- default: a fixed RAM-backed path, regardless of TMPDIR, HOME and XDG_* ----
 case "$(uname -s)" in

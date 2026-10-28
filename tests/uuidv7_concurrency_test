@@ -4,7 +4,7 @@
 # process's own stream must be strictly increasing. Only the shared, exclusively
 # locked counter state can make this hold; an unlocked read-modify-write races.
 # The processes start together on a fresh state directory, so they also race to
-# create it and its counter file; none may give up and use its own counter.
+# create it and its counter file; none may fail to use it.
 set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PATH="$here/../bin:$PATH"
@@ -43,7 +43,7 @@ for f in $(find "$TMPDIR/out" -type f); do
 done
 check "every process's own stream strictly increasing" "[ $unordered -eq 0 ]"
 errs="$(find "$TMPDIR/err" -type f -exec cat {} +)"
-check "no process fell back to its own counter (stderr: ${errs:0:300})" '[ -z "$errs" ]'
+check "no process failed on the counter state (stderr: ${errs:0:300})" '[ -z "$errs" ]'
 
 echo "$((tests - fails))/$tests concurrency tests passed"
 [ "$fails" -eq 0 ]

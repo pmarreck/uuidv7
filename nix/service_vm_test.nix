@@ -1,7 +1,8 @@
 # Boots a NixOS VM with services.uuidv7 enabled and checks the machine-wide
 # service end to end: socket ownership and modes, two users sharing one
 # service, refused control commands, crash restart with the counter kept, and
-# the client's try-again/error policy once systemd's start limit is hit.
+# the client's try-again/error policy once systemd's start limit is hit, and
+# that a service which cannot use its state directory hands out no UUIDs.
 { self, pkgs }:
 pkgs.testers.runNixOSTest {
 	name = "uuidv7-service";
@@ -93,6 +94,31 @@ with subtest("past the start limit, clients say try again three times, then fail
 with subtest("after an administrator resets it, the service serves again"):
 	machine.succeed("systemctl reset-failed uuidv7.service uuidv7.socket")
 	machine.succeed("systemctl restart uuidv7.socket")
+	rc, out = run_as("alice", "uuidv7")
+	assert rc == 0 and re.fullmatch(r"[0-9a-f]{32}\n", out), out
+
+dropin = "/run/systemd/system/uuidv7.service.d/bad-state.conf"
+def restart_service():
+	machine.succeed("systemctl daemon-reload")
+	machine.succeed("systemctl stop uuidv7.service")
+	machine.succeed("systemctl reset-failed uuidv7.service uuidv7.socket")
+	machine.succeed("systemctl restart uuidv7.socket")
+
+with subtest("a service that cannot use its state directory hands out no UUIDs"):
+	# The symlink systemd makes to the DynamicUser state directory, which the
+	# daemon refuses: the configuration this unit had before it named the real path.
+	machine.succeed(f"mkdir -p {dropin.rsplit('/', 1)[0]}")
+	machine.succeed(f"printf '[Service]\\nEnvironment=UUIDV7_STATE_DIR=/run/uuidv7-state\\n' > {dropin}")
+	restart_service()
+	results = [run_as(user, "timeout 30 uuidv7") for user in ("alice", "bob")]
+	print("misconfigured service, client results:", results)
+	assert all(rc not in (0, 124) for rc, out in results), results
+	assert not any(re.search(r"^[0-9a-f]{32}$", out, re.M) for rc, out in results), results
+	machine.wait_until_succeeds(
+		"journalctl -u uuidv7.service --no-pager | grep -q 'error: cannot use the counter state in /run/uuidv7-state'")
+	machine.fail("systemctl is-active uuidv7.service")
+	machine.succeed(f"mv {dropin} /root/")
+	restart_service()
 	rc, out = run_as("alice", "uuidv7")
 	assert rc == 0 and re.fullmatch(r"[0-9a-f]{32}\n", out), out
 '';

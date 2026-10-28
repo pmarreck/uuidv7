@@ -35,7 +35,7 @@ local derrf = run .. "/derr"   -- capture daemon stderr (LuaJIT tracebacks land 
 local dh   -- popen handle for the daemon child
 local function start_daemon()
 	local cmd = string.format(
-		"env UUIDV7_SOCK=%q UUIDV7_LOG=%q LUA_PATH=%q UUIDV7_SILENCE_INSECURE_RANDOM=1 %q --daemon 2>%q",
+		"exec env UUIDV7_SOCK=%q UUIDV7_LOG=%q LUA_PATH=%q UUIDV7_SILENCE_INSECURE_RANDOM=1 %q --daemon 2>%q",
 		sock, logf, libp, exe, derrf)
 	dh = sh.popen(cmd, "r")
 end

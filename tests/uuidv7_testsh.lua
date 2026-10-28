@@ -18,6 +18,8 @@ function M.cmd(line)
 	return 'bash "' .. path .. '"'
 end
 
+-- Start a long-lived daemon with "exec ..." so it replaces the shell: otherwise
+-- macOS's sh reports a hard kill ("Killed: 9") on the suite's stderr.
 function M.popen(line, mode) return io.popen(M.cmd(line), mode) end
 
 function M.execute(line)
