@@ -381,6 +381,15 @@ function M.run(opts)
 	}
 	server.start_iso = (now_parts())
 	server.logfh = open_logfh()
+	-- An unusable state file goes to stderr (the journal, under a service manager)
+	-- and the log. Touching the counter once now reports it at start rather than
+	-- at the first request.
+	server.counter.on_unusable = function(msg)
+		io.stderr:write(msg); io.stderr:flush()   -- Windows buffers a redirected stderr
+		log_event("warning", { reason = "counter state unusable; serving from this process's own counter",
+			state_dir = server.counter.dir })
+	end
+	server.counter:locked(function() end)
 
 	local listen_fd, adopted = make_listener()
 	server.listen_fd = listen_fd

@@ -288,6 +288,20 @@ function M.open_private_dir(dir)
 	return fd
 end
 
+-- Create-or-open a file in the open private directory `dfd` (0600, never through
+-- a symlink). macOS sometimes fails openat(O_CREAT) with ENOENT while other
+-- processes create the same new file (seen with 24 concurrent first calls), so
+-- ENOENT is retried a few times. Returns the fd, or -1.
+local ENOENT, CREATE_ATTEMPTS = 2, 4
+local function create_state_file(dfd, name)
+	local fd = -1
+	for _ = 1, CREATE_ATTEMPTS do
+		fd = C.openat(dfd, name, bit.bor(O_CREAT, O_RDWR, O_NOFOLLOW), ffi.new("int", 384))   -- 0600
+		if fd >= 0 or ffi.errno() ~= ENOENT then break end
+	end
+	return fd
+end
+
 -- Path of a file in the state directory, or nil.
 function M.state_file(name)
 	local dir = M.state_dir()
@@ -324,7 +338,7 @@ function M.write_state_text(name, text)
 	end
 	local dfd = M.open_private_dir(dir)
 	if not dfd then return false end
-	local fd = C.openat(dfd, name, bit.bor(O_CREAT, O_RDWR, O_NOFOLLOW), ffi.new("int", 384))   -- 0600
+	local fd = create_state_file(dfd, name)
 	C.close(dfd)
 	if fd < 0 then return false end
 	C.ftruncate(fd, 0)
@@ -424,6 +438,31 @@ function M.trusted_socket(path)
 	return true
 end
 
+-- The warning for a counter that cannot use its state file (no state directory,
+-- one that is not private or is a symlink, or a symlinked sequence file). Values
+-- from such a process are not ordered with any other process's, so this is never
+-- silent. uuidv7z prints the same text.
+function M.unusable_state_warning(prog, dir)
+	if not dir then
+		return prog .. ": warning: no counter state directory found (set UUIDV7_STATE_DIR); " ..
+			"this process uses its own counter, so its UUIDs are not ordered with other processes'\n"
+	end
+	return prog .. ": warning: cannot use the counter state in " .. dir ..
+		" (it must be a private directory owned by this user, with no symlinks); " ..
+		"this process uses its own counter, so its UUIDs are not ordered with other processes'\n"
+end
+
+-- Report a switch to this process's own counter once per switch, not per value:
+-- the warning repeats only after the state file has been usable again.
+-- `on_unusable(message)` overrides where it goes (the daemon also logs it).
+local function note_state(self, usable)
+	if usable then self._fallback = false; return end
+	if self._fallback then return end
+	self._fallback = true
+	local msg = M.unusable_state_warning("uuidv7", self.dir)
+	if self.on_unusable then self.on_unusable(msg) else io.stderr:write(msg); io.stderr:flush() end
+end
+
 -- Filesystem (Linux and macOS CLI default): flock'd file in the state directory, atomic cross-process RMW.
 local FsCounter = {}
 FsCounter.__index = FsCounter
@@ -445,10 +484,11 @@ function FsCounter:locked(fn)
 	local fd = -1
 	local dfd = self.dir and M.open_private_dir(self.dir)
 	if dfd then
-		fd = C.openat(dfd, "sequence", bit.bor(O_CREAT, O_RDWR, O_NOFOLLOW), ffi.new("int", 384))   -- 0600
+		fd = create_state_file(dfd, "sequence")
 		C.close(dfd)
 	end
 	local mem = MemoryCounter:new()
+	note_state(self, fd >= 0)
 	if fd < 0 then
 		mem._nt, mem._ctr = self._nt, self._ctr
 		local r = { fn(mem) }
@@ -475,7 +515,7 @@ end
 local WinCounter = {}
 WinCounter.__index = WinCounter
 function WinCounter:new()
-	return setmetatable({ filepath = M.state_file("sequence"), _nt = nil, _ctr = nil }, self)
+	return setmetatable({ dir = M.state_dir(), filepath = M.state_file("sequence"), _nt = nil, _ctr = nil }, self)
 end
 function WinCounter:locked(fn)
 	local GENERIC_RW, SHARE_RW, OPEN_ALWAYS, LOCKFILE_EXCLUSIVE = 0xC0000000, 3, 4, 2
@@ -492,6 +532,7 @@ function WinCounter:locked(fn)
 		if not h then M.ensure_dir(M.state_dir()); h = open_file() end
 	end
 	local mem = MemoryCounter:new()
+	note_state(self, h ~= nil)
 	if h == nil then
 		mem._nt, mem._ctr = self._nt, self._ctr
 		local r = { fn(mem) }

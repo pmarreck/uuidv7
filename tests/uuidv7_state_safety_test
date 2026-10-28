@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The counter state file must never be a way to write elsewhere: a symlink
 # planted at the state path (for example in a shared /tmp) is not followed, so its
-# target is neither overwritten nor created. Checked for both CLIs.
+# target is neither overwritten nor created, and the CLI warns that it is using
+# its own counter. Checked for both CLIs.
 set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export UUIDV7_NO_DAEMON=1 UUIDV7_SILENCE_INSECURE_RANDOM=1
@@ -26,9 +27,10 @@ for entry in "${clis[@]}"; do
 	d="$TMPDIR/$name"; mkdir -p "$d/state" "$d/elsewhere"
 	printf 'precious data\n' > "$d/elsewhere/victim"
 	ln -s "$d/elsewhere/victim" "$d/state/sequence"
-	out="$(UUIDV7_STATE_DIR="$d/state" $cmd 2>/dev/null)"; rc=$?
+	out="$(UUIDV7_STATE_DIR="$d/state" $cmd 2>"$d/err")"; rc=$?; err="$(cat "$d/err")"
 	check "$name: a symlinked state file's target is not overwritten" '[ "$(cat "$d/elsewhere/victim")" = "precious data" ]'
 	check "$name: generation still succeeds" '[ "$rc" -eq 0 ] && [[ "$out" =~ ^[0-9a-f]{32}$ ]]'
+	check "$name: ... and warns that it uses its own counter" '[[ "$err" == *"warning: cannot use the counter state in $d/state"*"own counter"* ]]'
 
 	mv "$d/state/sequence" "$d/old-link"
 	ln -s "$d/elsewhere/created" "$d/state/sequence"

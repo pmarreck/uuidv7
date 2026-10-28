@@ -6,6 +6,8 @@
 --   restarting to the service manager. Everything else, status included, works.
 --   With LISTEN_FDS/LISTEN_PID (systemd socket activation) the daemon adopts fd 3
 --   instead of binding, and does not remove the socket file it did not create.
+--   An unusable state directory makes the daemon warn on stderr and in its log
+--   when it starts, then serve from its own counter.
 -- systemd-socket-activate provides the real handoff on Linux; elsewhere that part
 -- is n/a (systemd is Linux-only). No sleeps: daemons announce readiness on stdout.
 local self_dir = (arg and arg[0] or ""):match("^(.*)[/\\][^/\\]+$") or "."
@@ -80,7 +82,57 @@ local function body()
 		ok("--daemon with an unknown option binds no socket", not exists(run .. "/bogus.sock"))
 	end
 
-	-- 3. LISTEN_FDS meant for another process (LISTEN_PID mismatch) is ignored.
+	-- 3. An unusable state directory is never silent: the daemon warns on stderr
+	-- (the journal, under a service manager) and logs it when it starts, and keeps
+	-- serving from its own counter. A path under a regular file fails on every OS.
+	do
+		local blocker = run .. "/not-a-dir"
+		local f = io.open(blocker, "wb"); f:write("x"); f:close()
+		local bad = blocker .. "/state"
+		local s3, e3 = run .. "/bad.sock", run .. "/bad.err"
+		local h3 = sh.popen(string.format("env %s %q --daemon --service 2>%q",
+			denv(s3, string.format("UUIDV7_STATE_DIR=%q", bad)), exe, e3), "r")
+		handles[#handles + 1] = { h = h3, sock = s3 }
+		ok("unusable state directory: the daemon still starts", wait_for(h3, "UUIDV7-LISTENING"))
+		local function warnings() return select(2, (read_file(e3) or ""):gsub("warning: cannot use the counter state in ", "")) end
+		ok("unusable state directory: warned at start, before any request", warnings() == 1, read_file(e3))
+		ok("unusable state directory: the warning names the directory",
+			(read_file(e3) or ""):find("counter state in " .. bad, 1, true) ~= nil, read_file(e3))
+		ok("unusable state directory: the warning is logged",
+			(read_file(logf) or ""):match('"event":"warning"[^\n]*counter state') ~= nil
+			or (read_file(logf) or ""):match('counter state[^\n]*"event":"warning"') ~= nil, read_file(logf))
+		local served = true
+		for _ = 1, 3 do served = served and is_uuid(client.oneshot(s3, "")) end
+		ok("unusable state directory: the daemon serves from its own counter", served)
+		ok("unusable state directory: warned once, not per request", warnings() == 1, read_file(e3))
+		handles[#handles].pid = pid_of(s3)
+	end
+	-- A state directory that goes bad while the daemon runs warns at the next
+	-- request, and again after it has recovered and gone bad once more.
+	if is_windows then
+		io.write("n/a: state directory going bad at run time (POSIX modes)\n")
+	else
+		local good = run .. "/flaky"
+		sh.execute(string.format("mkdir -p '%s' && chmod 700 '%s'", good, good))
+		local s4, e4 = run .. "/flaky.sock", run .. "/flaky.err"
+		local h4 = sh.popen(string.format("env %s %q --daemon --service 2>%q",
+			denv(s4, string.format("UUIDV7_STATE_DIR=%q", good)), exe, e4), "r")
+		handles[#handles + 1] = { h = h4, sock = s4 }
+		local up = wait_for(h4, "UUIDV7-LISTENING")
+		handles[#handles].pid = pid_of(s4)
+		local function warnings() return select(2, (read_file(e4) or ""):gsub("warning: cannot use the counter state in ", "")) end
+		local function request_with(mode) sh.execute(string.format("chmod %s '%s'", mode, good)); return is_uuid(client.oneshot(s4, "")) end
+		local seen = {}
+		for _, mode in ipairs({ "700", "777", "777", "700", "777" }) do
+			local served = request_with(mode)
+			seen[#seen + 1] = mode .. (served and "" or "!") .. "=" .. warnings()
+		end
+		sh.execute(string.format("chmod 700 '%s'", good))
+		ok("state directory going bad at run time: warns per switch, not per request",
+			up and table.concat(seen, " ") == "700=0 777=1 777=1 700=1 777=2", table.concat(seen, " "))
+	end
+
+	-- 4. LISTEN_FDS meant for another process (LISTEN_PID mismatch) is ignored.
 	do
 		local s2 = run .. "/own.sock"
 		local h2 = sh.popen(string.format("env %s %q --daemon --service 2>>%q",
@@ -91,7 +143,7 @@ local function body()
 		handles[#handles].pid = pid_of(s2)
 	end
 
-	-- 4. systemd socket activation (Linux).
+	-- 5. systemd socket activation (Linux).
 	if not is_linux then
 		io.write("n/a: systemd socket activation (systemd is Linux-only)\n")
 		return

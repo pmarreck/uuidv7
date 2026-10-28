@@ -30,6 +30,7 @@
 #include <io.h>
 #include <wchar.h>
 #else
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -192,12 +193,42 @@ static int open_private_dir(const char *dir) {
 	}
 	return fd;
 }
+
+#define STATE_CREATE_ATTEMPTS 4
+/* Create-or-open `name` in the open private directory `dfd` (0600, never through
+ * a symlink). macOS sometimes fails openat(O_CREAT) with ENOENT while other
+ * processes create the same new file (seen with 24 concurrent first calls), so
+ * ENOENT is retried a few times. Returns the fd, or -1. */
+static int create_state_file(int dfd, const char *name) {
+	int fd = -1;
+	for (int attempt = 0; attempt < STATE_CREATE_ATTEMPTS; attempt++) {
+		fd = openat(dfd, name, O_CREAT | O_RDWR | O_NOFOLLOW, 0600);
+		if (fd >= 0 || errno != ENOENT) break;
+	}
+	return fd;
+}
 #endif
 
 /* ---- counter state: one exclusively locked file shared by all processes ---- */
 
+/* Values from a process without the shared state file are not ordered with any
+ * other process's, so falling back is never silent: one warning per process,
+ * the same text as the LuaJIT CLI. */
+static void warn_unusable_state(const char *dir) {
+	static int warned;
+	if (warned) return;
+	warned = 1;
+	if (!dir)
+		fputs(PROG ": warning: no counter state directory found (set UUIDV7_STATE_DIR); "
+			"this process uses its own counter, so its UUIDs are not ordered with other processes'\n", stderr);
+	else
+		fprintf(stderr, PROG ": warning: cannot use the counter state in %s (it must be a private directory "
+			"owned by this user, with no symlinks); this process uses its own counter, so its UUIDs are "
+			"not ordered with other processes'\n", dir);
+}
+
 /* Read-modify-write of the stored state under an exclusive lock. Without a
- * usable state file, falls back to this process's own (empty) state. */
+ * usable state file, warns and falls back to this process's own (empty) state. */
 static uuidv7_state next_state(int64_t current, int is_static) {
 	uuidv7_state stored, out;
 	uint8_t kind, used;
@@ -217,7 +248,6 @@ static uuidv7_state next_state(int64_t current, int is_static) {
 			h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
 				OPEN_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
 		}
-		free(dir);
 	}
 	if (h != INVALID_HANDLE_VALUE) {
 		OVERLAPPED ov;
@@ -235,6 +265,7 @@ static uuidv7_state next_state(int64_t current, int is_static) {
 			}
 			UnlockFileEx(h, 0, MAXDWORD, MAXDWORD, &ov);
 			CloseHandle(h);
+			free(dir);
 			return out;
 		}
 		CloseHandle(h);
@@ -245,9 +276,8 @@ static uuidv7_state next_state(int64_t current, int is_static) {
 	int fd = -1;
 	if (dir) {
 		int dfd = open_private_dir(dir);
-		free(dir);
 		if (dfd >= 0) {
-			fd = openat(dfd, STATE_FILE, O_CREAT | O_RDWR | O_NOFOLLOW, 0600);
+			fd = create_state_file(dfd, STATE_FILE);
 			close(dfd);
 		}
 	}
@@ -263,11 +293,14 @@ static uuidv7_state next_state(int64_t current, int is_static) {
 			}
 			flock(fd, LOCK_UN);
 			close(fd);
+			free(dir);
 			return out;
 		}
 		close(fd);
 	}
 #endif
+	warn_unusable_state(dir);
+	free(dir);
 	uuidv7_advance(NULL, current, is_static, seed, &out, &kind, &used);
 	return out;
 }
@@ -359,7 +392,7 @@ static void write_state_text(const char *name, const char *text) {
 	int dfd = open_private_dir(dir);
 	free(dir);
 	if (dfd < 0) return;
-	int fd = openat(dfd, name, O_CREAT | O_RDWR | O_NOFOLLOW, 0600);
+	int fd = create_state_file(dfd, name);
 	close(dfd);
 	if (fd < 0) return;
 	if (ftruncate(fd, 0) != 0 || write(fd, text, len) != (ssize_t)len) { /* advisory */ }

@@ -53,7 +53,9 @@ with subtest("two users are served by the one service, with no warnings"):
 with subtest("the state is private to the service's dynamic user"):
 	owner = machine.succeed("stat -c '%U %a' /run/private/uuidv7-state").split()
 	assert owner[0] != "root" and owner[1] == "700", owner
-	# The daemon writes its counter through to the file (no silent in-memory fallback).
+	# The daemon could use its state directory (it warns in the journal if not) and
+	# writes its counter through to the file.
+	assert "cannot use the counter state" not in machine.succeed("journalctl -u uuidv7.service --no-pager"), "state warning in the journal"
 	assert re.fullmatch(r"\d+:\d+", machine.succeed("cat /run/private/uuidv7-state/sequence")), "no counter state"
 	machine.fail("su - alice -c 'cat /run/private/uuidv7-state/sequence'")
 

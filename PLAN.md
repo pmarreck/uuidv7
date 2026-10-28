@@ -4,8 +4,6 @@ Open work in priority order. Completed items: [docs/PLAN_LOG.md](docs/PLAN_LOG.m
 
 ## Next (authorized, unblocked)
 - [ ] Counter/daemon scope audit (Turing request 2026-10-14): state file and socket are found via TMPDIR/XDG_RUNTIME_DIR, so sharing is per matching environment; add deterministic regressions for differing TMPDIR, daemon/standalone transitions and unsafe shared /tmp, then fix within per-user scope (context: docs/plan_context/counter_scope.md)
-	- [x] Measure the boundaries: differing TMPDIR 20/40 out of order, nix develop sets a per-shell TMPDIR, unusable file falls back silently, socket uses a different lookup (done 2026-10-14 19:25 EDT)
-	- [x] Fix: state file written through a planted symlink (O_NOFOLLOW in both CLIs, tests/uuidv7_state_safety_test) (done 2026-10-14 19:21 EDT, 7746c5a)
 	- [x] Per-user state directory at a fixed RAM-backed path (/tmp/uuidv7-<uid>, verified 0700 and owned; Local AppData\Temp\uuidv7 with FILE_ATTRIBUTE_TEMPORARY on Windows), UUIDV7_STATE_DIR override; counter file and default socket both there (done 2026-10-19 19:58 EDT)
 	- [ ] Daemon clients refuse a socket owned by another user (SO_PEERCRED / getpeereid)
 	- [x] Daemon persistence: write the per-user state file on every allocation (RAM) and seed from it at start; measure the cost (phase 1, context: docs/plan_context/system_service.md) (done 2026-10-21 15:05 EDT)
@@ -13,7 +11,9 @@ Open work in priority order. Completed items: [docs/PLAN_LOG.md](docs/PLAN_LOG.m
 	- [x] Phase 2: client discovery order, system-socket trust check and refused-service policy (exit 75 x3, then 1) in uuidv7 and uuidv7z (done 2026-10-23 14:40 EDT)
 	- [x] Phase 3: systemd socket activation, unit files, NixOS module and NixOS VM test; `--daemon --service` refuses control commands (+++, r, l) while the per-user daemon keeps them (done 2026-10-23 23:50 EDT)
 	- [ ] Phase 3 on a real Linux host: enable the units and rerun the VM test's checks there (install needs approval)
-	- [ ] The service silently used an in-memory counter when its state directory was unusable (a symlink, found in the VM test); decide fail-closed vs warn with the unusable-state-file policy (context: docs/plan_context/system_service.md)
+	- [x] An unusable state directory is never silent (BDFN 2026-10-28): the daemon and both CLIs warn on stderr, the daemon logs it and warns at start, the VM test checks the service journal has no such warning (done 2026-10-28 09:45 EDT)
+	- [x] Found by that warning: on macOS, openat(O_CREAT) of a new counter file sometimes fails with ENOENT while concurrent processes create it (Lua 3 of 160 rounds of 24 first calls, uuidv7z 2 of 700), so the process silently used its own counter; both CLIs now retry ENOENT (0 of 300 and 0 of 1200 after); tests/uuidv7_concurrency_test fails on any state warning (done 2026-10-28 09:40 EDT)
+	- [ ] Decide whether service mode should refuse to start (fail closed) rather than warn when its state file is unusable, with the RNG-failure policy (context: docs/plan_context/system_service.md)
 	- [ ] Phase 4: launchd socket activation and plist (real-host sudo needs approval)
 	- [ ] Phase 5: Windows service host (install on the test host needs approval)
 	- [x] Decided: refused system socket -> service restarted up to N times with a try-again message, then an error; macOS state in /private/tmp by default, configurable (done 2026-10-21 14:46 EDT)
@@ -27,6 +27,7 @@ Open work in priority order. Completed items: [docs/PLAN_LOG.md](docs/PLAN_LOG.m
 - [ ] Decision uuidv7-os-rng-failure-policy revision 2 (queued 2026-10-14): fail closed or keep the warn + clock-seeded fallback when the OS RNG fails
 
 ## Investigate
+- [ ] macOS: the daemon suites print `sh: line 1: N Killed: 9 env ...` when cleanup hard-kills a daemon started with popen (6 lines per ./test run); make it silent, e.g. exec the daemon from the popen shell
 - [ ] macOS: 24 concurrent `bin/uuidv7` launches via the `#!/usr/bin/env luajit` shebang fail with ENOMEM / SIGKILL at exec on one Mac under swap pressure (85% used); `luajit bin/uuidv7` never fails; cause unproven (2026-10-14)
 
 ## Blocked on hardware

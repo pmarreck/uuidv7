@@ -21,7 +21,7 @@ The two lookups differ, and both depend on environment variables.
   `/tmp`; login shells may set their own.
 - An unusable state file (for example read-only, or owned by another user in a
   shared `/tmp`) silently falls back to per-process state: ordering broke with no
-  warning.
+  warning. Since 2026-10-28 both CLIs and the daemon warn on stderr when this happens.
 - A symlink at the state path was followed and its target overwritten or created.
   Fixed in 7746c5a (`O_NOFOLLOW`), covered by `tests/uuidv7_state_safety_test`.
 - The daemon clients do not check who owns the socket they connect to. With the
@@ -59,8 +59,9 @@ The two lookups differ, and both depend on environment variables.
 BDFN chose per user now, cross-user later (2026-10-15). Done: the per-user state
 directory below (both CLIs, daemon and clients; `tests/uuidv7_state_dir_test`).
 Done 2026-10-21: daemon crash persistence (the daemon counter is the write-through
-state file; `tests/uuidv7_daemon_persist_test`). Open: the daemon owner check and
-the unusable-file policy. Cross-user ordering is planned in `system_service.md`.
+state file; `tests/uuidv7_daemon_persist_test`). Open: the daemon owner check, and
+whether an unusable state file should fail closed rather than warn (it warns
+since 2026-10-28; BDFN: never silent). Cross-user ordering is planned in `system_service.md`.
 
 ## Proposed fix
 
