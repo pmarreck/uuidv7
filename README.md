@@ -43,10 +43,14 @@ remain strictly ordered and unique.
   cannot encode pre-1970 time, and an overflow must not silently become a wrong time).
   Options and the timestamp may come in any order (`uuidv7 123 --hyphen`); with several
   timestamps the last one wins, `--` ends option parsing, and any other argument exits 1.
-- Counter state lives in one per-user directory at a fixed path, never taken from
-  `TMPDIR`, `HOME` or `XDG_*`, so every shell, Nix dev shell, cron job and service of a
-  user shares it: `/tmp/uuidv7-<uid>/` on Linux and macOS (`<uid>` is the effective user
-  ID), `%LOCALAPPDATA%\Temp\uuidv7\` on Windows. It holds the counter file `sequence` and
+- Counter state lives in one per-user directory, never found through `TMPDIR`, `HOME`
+  or `XDG_*`, so every shell, Nix dev shell, cron job and service of a user shares it:
+  on Linux and macOS `/tmp/uuidv7-<uid>-<uuidv7>/` (`<uid>` is the effective user ID; the
+  UUIDv7 makes the name unguessable), on Windows `%LOCALAPPDATA%\Temp\uuidv7\`. The name is
+  remembered in `~/.local/state/uuidv7/state-dir`, with `~` taken from the account
+  database rather than `$HOME` (`UUIDV7_STATE_HOME` overrides that directory). If another
+  user takes the remembered name (it can be seen in `/tmp`, and recreated by anyone after a
+  reboot), a new name is chosen, so nobody else can block your counter. It holds the counter file `sequence` and
   the daemon socket `uuidv7.sock`. `/tmp` keeps the per-call writes in RAM where it is
   tmpfs (common on Linux) or a RAM disk; on Windows the file is created with
   `FILE_ATTRIBUTE_TEMPORARY` so the cache manager keeps it in memory. The state does not
@@ -174,7 +178,7 @@ Both CLIs pick the daemon socket in this order:
    directory must be a real directory owned by root or you that group and other cannot
    write; on Windows the directory and the socket must be owned by a system account,
    Administrators or you. Otherwise the CLI says it is ignoring it and goes on.
-3. The per-user daemon socket, `/tmp/uuidv7-<uid>/uuidv7.sock`.
+3. The per-user daemon socket, `uuidv7.sock` in the per-user state directory.
 4. No daemon: the per-user counter file.
 
 If a trusted system socket refuses connections (the service crashed and left its socket

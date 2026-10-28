@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
 # Where the shared counter state lives. Both CLIs (and the daemon socket) use one
-# per-user directory in RAM-backed temporary storage at a fixed path, never taken
-# from TMPDIR, HOME or XDG_* (those differ between shells, Nix dev shells, cron and
-# services): /tmp/uuidv7-<uid> on Linux and macOS,
-# <Local AppData>\Temp\uuidv7 on Windows. UUIDV7_STATE_DIR overrides it. In a
-# shared directory it is used only if it is a real directory, owned by the user,
-# with mode 0700. Otherwise the CLI generates nothing and exits 1: a UUID from a
-# counter of its own would not be ordered with other processes' UUIDs.
+# per-user directory in RAM-backed temporary storage, never found through TMPDIR,
+# HOME or XDG_* (those differ between shells, Nix dev shells, cron and services).
+# On Linux and macOS it is /tmp/uuidv7-<uid>-<uuidv7>, an unguessable name
+# remembered in a private directory of the user's (~/.local/state/uuidv7 from the
+# account database; UUIDV7_STATE_HOME here), and a new name is chosen when another
+# user takes the remembered one. On Windows it is <Local AppData>\Temp\uuidv7.
+# UUIDV7_STATE_DIR overrides it. In a shared directory it is used only if it is a
+# real directory, owned by the user, with mode 0700. Otherwise the CLI generates
+# nothing and exits 1: a UUID from a counter of its own would not be ordered with
+# other processes' UUIDs. (context: docs/plan_context/counter_scope.md)
 set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export UUIDV7_NO_DAEMON=1 UUIDV7_SILENCE_INSECURE_RANDOM=1
 T="$(mktemp -d)"
-trap 'rm -rf "$T"' EXIT
+uid="$(id -u)"
+# State directories this suite creates in /tmp are removed with it.
+mine() { find -H /tmp -maxdepth 1 -name "uuidv7-$uid-*" 2>/dev/null | sort; }   # -H: /tmp is a symlink on macOS
+before="$(mine)"
+trap 'comm -13 <(printf "%s\n" "$before") <(mine) | while read -r d; do [ -n "$d" ] && rm -rf "$d"; done; rm -rf "$T"' EXIT
 lua=(luajit "$here/../bin/uuidv7")
 zig="${UUIDV7Z:-}"
 
@@ -78,12 +85,80 @@ for impl in lua zig; do
 	check "$impl: a state directory that cannot be created: no UUID (exit 1), with an error" '[ "$rc" -eq 1 ] && [ -z "$out" ] && [[ "$err" == *"error: cannot use the counter state in "*"blocker"* ]]'
 done
 
-# ---- default: a fixed RAM-backed path, regardless of TMPDIR, HOME and XDG_* ----
-case "$(uname -s)" in
-	Linux|Darwin) base=/tmp; def="$base/uuidv7-$(id -u)" ;;
-	*) base="$(cygpath -u "$LOCALAPPDATA")/Temp"; def="$base/uuidv7" ;;
-esac
-if [ -d "$base" ] && [ -w "$base" ]; then
+# ---- default (Linux, macOS): an unguessable name in /tmp, remembered ----
+if [ "$is_windows" -eq 0 ]; then
+	pat="^/tmp/uuidv7-$uid-[0-9a-f]{32}\$"
+	mode_of() { { stat -c %a "$1" || stat -f %Lp "$1"; } 2>/dev/null; }
+	sh_home="$T/statehome"
+	dflt=(env -u UUIDV7_STATE_DIR -u XDG_STATE_HOME -u XDG_RUNTIME_DIR UUIDV7_STATE_HOME="$sh_home" HOME="$T/fakehome" TMPDIR="$T/tmp1")
+	out="$("${dflt[@]}" "${lua[@]}" "$S" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
+	ptr="$(cat "$sh_home/state-dir" 2>/dev/null)"
+	check "default: the LuaJIT CLI picks /tmp/uuidv7-<uid>-<32 hex> and remembers it ($ptr)" '[ "$rc" -eq 0 ] && [ -z "$err" ] && [[ "$ptr" =~ $pat ]]'
+	check "default: the directory is private (0700) and holds the counter" '[ "$(mode_of "$ptr")" = 700 ] && [[ "$(cat "$ptr/sequence" 2>/dev/null)" == "$S:"* ]]'
+	check "default: the remembered name is private too (0700 directory)" '[ "$(mode_of "$sh_home")" = 700 ]'
+	check "default: nothing is written to HOME or TMPDIR" '[ ! -e "$T/fakehome" ] && [ -z "$(find "$T/tmp1" -mindepth 1)" ]'
+	a="$(cat "$ptr/sequence" 2>/dev/null)"
+	"${dflt[@]}" "$zig" "$S" >/dev/null 2>"$T/err"
+	b="$(cat "$ptr/sequence" 2>/dev/null)"
+	check "default: uuidv7z uses the remembered directory ($a -> $b)" '[ "${b%%:*}" = "$S" ] && [ "${b#*:}" -gt "${a#*:}" ] && [ ! -s "$T/err" ]'
+
+	# After a reboot /tmp is empty: the remembered name is created again.
+	mv "$ptr" "$T/rebooted"
+	out="$("${dflt[@]}" "$zig" "$S" 2>"$T/err")"; rc=$?
+	check "default: a removed directory is recreated under the same name" '[ "$rc" -eq 0 ] && [ "$(cat "$sh_home/state-dir")" = "$ptr" ] && [ "$(mode_of "$ptr")" = 700 ] && [ -s "$ptr/sequence" ]'
+
+	# Taken by someone else (here a planted symlink, then a file): a new name.
+	mkdir -p "$T/elsewhere"; mv "$ptr" "$T/rebooted2"; ln -s "$T/elsewhere" "$ptr"
+	out="$("${dflt[@]}" "${lua[@]}" "$S" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
+	ptr2="$(cat "$sh_home/state-dir")"
+	check "lua: a remembered name taken by a symlink: new name, UUID served" '[ "$rc" -eq 0 ] && [[ "$out" =~ ^[0-9a-f]{32}$ ]] && [ -z "$err" ] && [[ "$ptr2" =~ $pat ]] && [ "$ptr2" != "$ptr" ] && [ -s "$ptr2/sequence" ]'
+	check "lua: ... the symlink is left alone and not written through" '[ -L "$ptr" ] && [ -z "$(ls -A "$T/elsewhere")" ]'
+	mv "$ptr2" "$T/rebooted3"; printf x > "$ptr2"
+	out="$("${dflt[@]}" "$zig" "$S" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
+	ptr3="$(cat "$sh_home/state-dir")"
+	check "zig: a remembered name taken by a file: new name, UUID served" '[ "$rc" -eq 0 ] && [[ "$out" =~ ^[0-9a-f]{32}$ ]] && [ -z "$err" ] && [[ "$ptr3" =~ $pat ]] && [ "$ptr3" != "$ptr2" ] && [ -s "$ptr3/sequence" ]'
+	check "zig: ... the file is left alone" '[ "$(cat "$ptr2")" = x ]'
+
+	# The user's own directory opened to others is not replaced: an error.
+	chmod 777 "$ptr3"
+	for impl in lua zig; do
+		if [ "$impl" = lua ]; then run=("${lua[@]}"); else run=("$zig"); fi
+		out="$("${dflt[@]}" "${run[@]}" "$S" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
+		check "$impl: own state directory with group/other access: no UUID (exit 1), same name kept" '[ "$rc" -eq 1 ] && [ -z "$out" ] && [[ "$err" == *"error: cannot use the counter state in $ptr3"* ]] && [ "$(cat "$sh_home/state-dir")" = "$ptr3" ]'
+	done
+	chmod 700 "$ptr3"
+
+	# A remembered value that is not one of these names is ignored.
+	printf '/tmp/elsewhere\n' > "$sh_home/state-dir"
+	out="$("${dflt[@]}" "${lua[@]}" "$S" 2>"$T/err")"; rc=$?; ptr4="$(cat "$sh_home/state-dir")"
+	check "a remembered value of another form is replaced with a new name" '[ "$rc" -eq 0 ] && [[ "$ptr4" =~ $pat ]] && [ ! -e /tmp/elsewhere/sequence ]'
+
+	# Concurrent first calls agree on one directory: each CLI on its own, so that
+	# its own locking is contested (uuidv7z starts much faster than luajit).
+	for impl in lua zig; do
+		if [ "$impl" = lua ]; then run=("${lua[@]}"); else run=("$zig"); fi
+		sh2="$T/statehome-$impl"; pre="$(mine)"
+		for w in $(seq 1 24); do
+			env -u UUIDV7_STATE_DIR UUIDV7_STATE_HOME="$sh2" "${run[@]}" "$S" >"$T/c-$impl-$w" 2>&1 &
+		done
+		wait
+		new="$(comm -13 <(printf '%s\n' "$pre") <(mine))"
+		bad=0; for w in $(seq 1 24); do [[ "$(cat "$T/c-$impl-$w")" =~ ^[0-9a-f]{32}$ ]] || bad=$((bad + 1)); done
+		check "$impl: 24 concurrent first calls: all served ($bad not), one directory created ($new)" '[ "$bad" -eq 0 ] && [ "$(printf "%s\n" "$new" | grep -c .)" -eq 1 ] && [ "$new" = "$(cat "$sh2/state-dir")" ]'
+	done
+
+	# Where the name is remembered must be private too.
+	sh2="$T/statehome-open"; mkdir -m 777 "$sh2"; chmod 777 "$sh2"
+	out="$(env -u UUIDV7_STATE_DIR UUIDV7_STATE_HOME="$sh2" "$zig" "$S" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
+	check "a remembered-name directory others can write: no UUID (exit 1), naming it" '[ "$rc" -eq 1 ] && [ -z "$out" ] && [[ "$err" == *"$sh2"* ]]'
+	out="$(env -u UUIDV7_STATE_DIR UUIDV7_STATE_HOME="$sh2" "${lua[@]}" "$S" 2>"$T/err")"; rc=$?; err="$(cat "$T/err")"
+	check "lua: ... the same" '[ "$rc" -eq 1 ] && [ -z "$out" ] && [[ "$err" == *"$sh2"* ]]'
+	chmod 700 "$sh2"
+fi
+
+# ---- default (Windows): Local AppData, regardless of TMPDIR, HOME and XDG_* ----
+if [ "$is_windows" -eq 1 ]; then
+	def="$(cygpath -u "$LOCALAPPDATA")/Temp/uuidv7"
 	scramble=(env -u UUIDV7_STATE_DIR -u XDG_STATE_HOME -u XDG_RUNTIME_DIR HOME="$T/fakehome" TMPDIR="$T/tmp1" LOCALAPPDATA="$T/fakeappdata")
 	"${scramble[@]}" "${lua[@]}" "$S" >/dev/null
 	a="$(cat "$def/sequence" 2>/dev/null)"
@@ -91,9 +166,6 @@ if [ -d "$base" ] && [ -w "$base" ]; then
 	b="$(cat "$def/sequence" 2>/dev/null)"
 	check "default: the LuaJIT CLI writes $def/sequence despite HOME/TMPDIR/XDG/LOCALAPPDATA" '[[ "$a" == "$S:"* ]]'
 	check "default: uuidv7z advances the same file ($a -> $b)" '[ "${b%%:*}" = "$S" ] && [ "${b#*:}" -gt "${a#*:}" ]'
-else
-	echo "✗ $base is not a writable directory here; default-location checks not run" >&2
-	fails=$((fails + 1))
 fi
 
 echo "$((tests - fails))/$tests state-directory tests passed"

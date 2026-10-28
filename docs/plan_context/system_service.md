@@ -2,7 +2,7 @@
 
 BDFN chose a layered default: when an installed system service is reachable,
 every live request goes to it; otherwise the CLIs keep using the per-user
-`/tmp/uuidv7-<uid>` counter file. A fresh machine needs no install, and
+per-user counter file in `/tmp`. A fresh machine needs no install, and
 installing the service upgrades ordering from per user to machine-wide.
 
 ## What the service is
@@ -26,7 +26,7 @@ so the only exposure is flooding, which the existing per-request caps bound.
 
 1. `UUIDV7_SOCK`, if set.
 2. The system socket, if its file exists.
-3. The per-user daemon socket in `/tmp/uuidv7-<uid>/`.
+3. The per-user daemon socket in the per-user state directory.
 4. The per-user counter file.
 
 Clients accept the system socket only if its directory is not writable by

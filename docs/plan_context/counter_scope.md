@@ -100,3 +100,37 @@ are not an option.
 Known caveat of a home-based location: a home directory shared between machines
 over NFS would share the counter file across them (relying on NFS locking), and
 two machines' daemons would contend for one socket path.
+
+## Unguessable state directory (BDFN 2026-10-28)
+
+Failing closed made a fixed name a denial-of-service target: another local user
+who creates `/tmp/uuidv7-<uid>` first makes every CLI call of this user exit 1.
+BDFN chose an unguessable name instead, remembered where only this user can
+write. Linux and macOS only; Windows already uses the private per-user Local
+AppData folder.
+
+- The state directory is `/tmp/uuidv7-<uid>-<uuidv7>`: 32 lowercase hex from a
+  UUIDv7 made with an in-memory counter (its random bits make the name
+  unguessable). It stays in RAM where `/tmp` is.
+- The name is remembered in `state-dir` (the full path and a newline) in
+  `~/.local/state/uuidv7/`, where `~` is the home directory from the account
+  database (`getpwuid(geteuid())`), not `$HOME`. That directory must be private
+  (0700, owned by the user, not a symlink). `UUIDV7_STATE_HOME` overrides it
+  (tests); `UUIDV7_STATE_DIR` still bypasses all of this.
+- A remembered value that does not match `/tmp/uuidv7-<uid>-<32 hex>` exactly is
+  ignored, as if absent.
+- Fast path, every call: read the remembered name and use the directory,
+  creating it if missing (after a reboot `/tmp` is empty and the same name is
+  created again).
+- `/tmp` can be listed, so the name is not secret while the directory exists. If
+  the remembered path exists but is not a directory owned by this user (another
+  user created it after a reboot, or planted a symlink or file), a new name is
+  chosen and remembered. The lost state was gone anyway, since the directory had
+  been removed. A directory of this user's own with group or other access is not
+  replaced: that is an error, as before.
+- Choosing a name (none remembered, or replacing a squatted one) happens under
+  `flock` on `state-dir.lock` beside `state-dir`, re-reading the name after the
+  lock is taken, and the new name is written to a temporary file and renamed into
+  place. Concurrent first calls therefore agree on one directory.
+- Both CLIs and the daemon follow the same protocol, so they share one
+  directory. A daemon resolves the name when it starts.

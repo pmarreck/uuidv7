@@ -32,6 +32,7 @@
 #else
 #include <errno.h>
 #include <fcntl.h>
+#include <pwd.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -119,11 +120,25 @@ static uint64_t random_u64(void) {
 
 /* ---- per-user state directory ---- */
 
-/* The directory holding the counter file and the daemon socket, at a fixed path
- * never taken from TMPDIR, HOME or XDG_* (those differ between shells, Nix dev
- * shells, cron and services): /tmp/uuidv7-<uid> on Linux and macOS, and
- * <Local AppData>\Temp\uuidv7 on Windows; $UUIDV7_STATE_DIR overrides it. Same
- * lookup as core.state_dir in the LuaJIT CLI. NULL if there is none. Caller frees. */
+static char *dup_str(const char *s) {
+	char *p = malloc(strlen(s) + 1);
+	if (!p) die(PROG ": out of memory\n");
+	return strcpy(p, s);
+}
+
+/* Why state_dir() returned NULL. */
+static char state_dir_why[MAX_STATE_PATH + 160];
+#ifndef _WIN32
+static char *remembered_state_dir(void);
+#endif
+
+/* The directory holding the counter file and the daemon socket, never found
+ * through TMPDIR, HOME or XDG_* (those differ between shells, Nix dev shells,
+ * cron and services): on Linux and macOS the unguessable /tmp/uuidv7-<uid>-<uuidv7>
+ * remembered in the user's state home (remembered_state_dir), on Windows
+ * <Local AppData>\Temp\uuidv7; $UUIDV7_STATE_DIR overrides it. Same lookup as
+ * core.state_dir in the LuaJIT CLI. NULL (and state_dir_why) if there is none.
+ * Caller frees. */
 static char *state_dir(void) {
 	const char *o = getenv("UUIDV7_STATE_DIR");
 	char buf[MAX_STATE_PATH];
@@ -139,14 +154,18 @@ static char *state_dir(void) {
 	}
 #ifdef _WIN32
 	char appdata[MAX_PATH];
-	if (SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, appdata) != S_OK) return NULL;
+	if (SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, appdata) != S_OK) {
+		snprintf(state_dir_why, sizeof state_dir_why, "no Local AppData folder found (set UUIDV7_STATE_DIR)");
+		return NULL;
+	}
 	snprintf(buf, sizeof buf, "%s\\Temp\\uuidv7", appdata);
-#else
-	snprintf(buf, sizeof buf, "/tmp/uuidv7-%lu", (unsigned long)geteuid());
-#endif
 	char *d = malloc(strlen(buf) + 1);
 	if (!d) die(PROG ": out of memory\n");
 	return strcpy(d, buf);
+#else
+	(void)buf;
+	return remembered_state_dir();
+#endif
 }
 
 /* Create `dir` and its missing ancestors (0700 on POSIX; Windows directories
@@ -207,6 +226,133 @@ static int create_state_file(int dfd, const char *name) {
 	}
 	return fd;
 }
+
+/* ---- the remembered state directory name (Linux, macOS) ---- */
+
+#define STATE_POINTER "state-dir"
+#define STATE_POINTER_TMP "state-dir.tmp"
+#define STATE_POINTER_LOCK "state-dir.lock"
+
+/* Where the state directory's name is remembered: $UUIDV7_STATE_HOME, else
+ * ~/.local/state/uuidv7 with ~ from the account database (getpwuid), not $HOME.
+ * NULL if there is no home directory. Caller frees. */
+static char *state_home(void) {
+	char buf[MAX_STATE_PATH];
+	const char *o = getenv("UUIDV7_STATE_HOME");
+	if (o && *o) snprintf(buf, sizeof buf, "%s", o);
+	else {
+		struct passwd *pw = getpwuid(geteuid());
+		if (!pw || !pw->pw_dir || !*pw->pw_dir) return NULL;
+		snprintf(buf, sizeof buf, "%s/.local/state/uuidv7", pw->pw_dir);
+	}
+	size_t len = strlen(buf);
+	while (len > 1 && buf[len - 1] == '/') buf[--len] = 0;
+	return dup_str(buf);
+}
+
+/* The remembered name into out, if it is exactly /tmp/uuidv7-<uid>-<32 lowercase
+ * hex> (with an optional newline). Returns 1 if so. */
+static int read_pointer(int hfd, char *out, size_t cap) {
+	char text[128], prefix[64];
+	int fd = openat(hfd, STATE_POINTER, O_RDONLY | O_NOFOLLOW);
+	if (fd < 0) return 0;
+	ssize_t n = read(fd, text, sizeof text - 1);
+	close(fd);
+	if (n <= 0) return 0;
+	if (text[n - 1] == '\n') n--;
+	text[n] = 0;
+	int pl = snprintf(prefix, sizeof prefix, "/tmp/uuidv7-%lu-", (unsigned long)geteuid());
+	if (n != pl + UUIDV7_COMPACT_LEN || strncmp(text, prefix, (size_t)pl) != 0) return 0;
+	for (ssize_t i = pl; i < n; i++)
+		if (!((text[i] >= '0' && text[i] <= '9') || (text[i] >= 'a' && text[i] <= 'f'))) return 0;
+	if ((size_t)n >= cap) return 0;
+	memcpy(out, text, (size_t)n + 1);
+	return 1;
+}
+
+/* 1 if `path` is this user's directory (created if missing, as after a reboot);
+ * 0 when something else is there: another user's directory, a symlink or a
+ * file. Permissions are left to open_private_dir. */
+static int claim_dir(const char *path) {
+	int fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+	if (fd < 0 && errno == ENOENT) {
+		mkdir(path, 0700);
+		fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+	}
+	if (fd < 0) return 0;
+	struct stat st;
+	int ours = fstat(fd, &st) == 0 && st.st_uid == geteuid();
+	close(fd);
+	return ours;
+}
+
+/* Remember `path` atomically: write a temporary file, then rename it into place. */
+static int write_pointer(int hfd, const char *path) {
+	int fd = openat(hfd, STATE_POINTER_TMP, O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW, 0600);
+	if (fd < 0) return 0;
+	size_t len = strlen(path);
+	int ok = write(fd, path, len) == (ssize_t)len && write(fd, "\n", 1) == 1;
+	close(fd);
+	return ok && renameat(hfd, STATE_POINTER_TMP, hfd, STATE_POINTER) == 0;
+}
+
+/* The unguessable state directory /tmp/uuidv7-<uid>-<uuidv7>, remembered in
+ * state_home(). A new name is chosen, under flock and re-checked after locking so
+ * concurrent first calls agree, when none is remembered or another user has taken
+ * the remembered one. The UUIDv7 comes from a fresh counter through the C ABI: only
+ * its random bits matter here. Same protocol as the LuaJIT CLI. */
+static char *remembered_state_dir(void) {
+	char dir[MAX_STATE_PATH];
+	char *home = state_home();
+	if (!home) {
+		snprintf(state_dir_why, sizeof state_dir_why,
+			"no home directory to remember the counter state directory in (set UUIDV7_STATE_DIR)");
+		return NULL;
+	}
+	int hfd = open_private_dir(home);
+	if (hfd < 0) {
+		snprintf(state_dir_why, sizeof state_dir_why, "cannot use %s to remember the counter state directory "
+			"(it must be a private directory owned by this user, with no symlinks)", home);
+		free(home);
+		return NULL;
+	}
+	if (read_pointer(hfd, dir, sizeof dir) && claim_dir(dir)) {
+		close(hfd);
+		free(home);
+		return dup_str(dir);
+	}
+	int lfd = create_state_file(hfd, STATE_POINTER_LOCK);
+	int found = 0;
+	if (lfd >= 0 && flock(lfd, LOCK_EX) == 0) {
+		found = read_pointer(hfd, dir, sizeof dir) && claim_dir(dir);
+		for (int attempt = 0; !found && attempt < STATE_CREATE_ATTEMPTS; attempt++) {
+			uuidv7_state st;
+			uint8_t kind, used, bytes[UUIDV7_BYTES];
+			char hex[UUIDV7_COMPACT_LEN + 1];
+			size_t hex_len = 0;
+			if (uuidv7_advance(NULL, now_ns(), 0, random_u64(), &st, &kind, &used) != UUIDV7_OK ||
+				uuidv7_encode(st.nanotime, st.counter, bytes, sizeof bytes) != UUIDV7_OK ||
+				uuidv7_format(bytes, sizeof bytes, 0, hex, sizeof hex, &hex_len) != UUIDV7_OK) break;
+			hex[hex_len] = 0;
+			snprintf(dir, sizeof dir, "/tmp/uuidv7-%lu-%s", (unsigned long)geteuid(), hex);
+			if (mkdir(dir, 0700) == 0) {
+				found = write_pointer(hfd, dir);
+				break;
+			}
+		}
+		flock(lfd, LOCK_UN);
+	}
+	if (lfd >= 0) close(lfd);
+	close(hfd);
+	if (!found) {
+		snprintf(state_dir_why, sizeof state_dir_why,
+			"cannot choose a counter state directory in /tmp (remembered in %s)", home);
+		free(home);
+		return NULL;
+	}
+	free(home);
+	return dup_str(dir);
+}
 #endif
 
 /* ---- counter state: one exclusively locked file shared by all processes ---- */
@@ -216,8 +362,8 @@ static int create_state_file(int dfd, const char *name) {
  * with the same text as the LuaJIT CLI. */
 static _Noreturn void die_unusable_state(const char *dir) {
 	if (!dir)
-		fputs(PROG ": error: no counter state directory found (set UUIDV7_STATE_DIR); "
-			"no UUID generated, since it would not be ordered with other processes' UUIDs\n", stderr);
+		fprintf(stderr, PROG ": error: %s; no UUID generated, since it would not be ordered with other "
+			"processes' UUIDs\n", state_dir_why[0] ? state_dir_why : "no counter state directory found (set UUIDV7_STATE_DIR)");
 	else
 		fprintf(stderr, PROG ": error: cannot use the counter state in %s (it must be a private directory "
 			"owned by this user, with no symlinks); no UUID generated, since it would not be ordered "
@@ -396,12 +542,6 @@ static void write_state_text(const char *name, const char *text) {
 }
 
 /* ---- daemon discovery ---- */
-
-static char *dup_str(const char *s) {
-	char *p = malloc(strlen(s) + 1);
-	if (!p) die(PROG ": out of memory\n");
-	return strcpy(p, s);
-}
 
 /* The per-user daemon socket: uuidv7.sock in the state directory, the same
  * lookup as the LuaJIT client and daemon. On POSIX a state directory that is
@@ -749,8 +889,9 @@ static void show_help(void) {
 		"  argument is an error.\n"
 		"\n"
 		"Strict ordering across processes comes from an exclusively locked counter file,\n"
-		"/tmp/uuidv7-<uid>/sequence (Windows: %LOCALAPPDATA%\\Temp\\uuidv7\\sequence), at a\n"
-		"fixed path rather than TMPDIR or HOME, and shared with the LuaJIT `uuidv7`;\n"
+		"/tmp/uuidv7-<uid>-<uuidv7>/sequence, an unguessable name remembered in\n"
+		"~/.local/state/uuidv7/state-dir (Windows: %LOCALAPPDATA%\\Temp\\uuidv7\\sequence),\n"
+		"not found through TMPDIR or HOME, and shared with the LuaJIT `uuidv7`;\n"
 		"UUIDV7_STATE_DIR overrides the directory. When a `uuidv7 --daemon` is running,\n"
 		"live generation is served by it, so both CLIs draw from one counter; explicit\n"
 		"timestamps stay local. If a reachable daemon will not serve, uuidv7z retries it\n"

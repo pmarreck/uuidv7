@@ -5,7 +5,9 @@ Open work in priority order. Completed items: [docs/PLAN_LOG.md](docs/PLAN_LOG.m
 ## Next (authorized, unblocked)
 - [ ] Counter/daemon scope audit (Turing request 2026-10-14): state file and socket are found via TMPDIR/XDG_RUNTIME_DIR, so sharing is per matching environment; add deterministic regressions for differing TMPDIR, daemon/standalone transitions and unsafe shared /tmp, then fix within per-user scope (context: docs/plan_context/counter_scope.md)
 	- [ ] Daemon clients refuse a socket owned by another user (SO_PEERCRED / getpeereid)
-	- [ ] Squatting: another local user can pre-create /tmp/uuidv7-<uid>, which now makes the CLIs fail closed; BDFN idea (2026-10-28): an unguessable /tmp/uuidv7-<uid>-<uuidv7> remembered in a user-only place; design to be agreed
+	- [x] Squatting: the per-user state directory is /tmp/uuidv7-<uid>-<uuidv7>, remembered in ~/.local/state/uuidv7/state-dir, renamed when another user takes it (BDFN 2026-10-28; context: docs/plan_context/counter_scope.md) (done 2026-10-28 13:10 EDT)
+	- [ ] Deterministic test that a CLI re-reads the remembered name after taking state-dir.lock (removing the re-read is not caught: concurrent first calls rarely contend); tried /proc/locks to see the CLI blocked, but the waiter never appeared there
+	- [ ] NixOS VM test: real cross-user squat (alice creates bob's remembered name after it is removed; bob still gets UUIDs under a new name)
 	- [x] Daemon persistence: write the per-user state file on every allocation (RAM) and seed from it at start; measure the cost (phase 1, context: docs/plan_context/system_service.md) (done 2026-10-21 15:05 EDT)
 - [ ] System service, layered default (BDFN 2026-10-19): plan approved 2026-10-21 (context: docs/plan_context/system_service.md)
 	- [x] Phase 2: client discovery order, system-socket trust check and refused-service policy (exit 75 x3, then 1) in uuidv7 and uuidv7z (done 2026-10-23 14:40 EDT)
@@ -16,7 +18,6 @@ Open work in priority order. Completed items: [docs/PLAN_LOG.md](docs/PLAN_LOG.m
 	- [x] Fail closed (BDFN 2026-10-28: no UUID without the ordering guarantee): a daemon that cannot use its state file refuses to start, a running one answers ERR, both CLIs exit 1; the VM test checks a misconfigured service hands out no UUIDs (done 2026-10-28 10:30 EDT)
 	- [ ] Phase 4: launchd socket activation and plist (real-host sudo needs approval)
 	- [ ] Phase 5: Windows service host (install on the test host needs approval)
-	- [x] Decided: refused system socket -> service restarted up to N times with a try-again message, then an error; macOS state in /private/tmp by default, configurable (done 2026-10-21 14:46 EDT)
 	- [x] Decided: the service manager restarts a crashed system service (systemd Restart=always + StartLimitBurst=N, launchd KeepAlive, SCM recovery actions) (done 2026-10-23 01:00 EDT)
 	- [x] Decided: N = 3 restarts before a refused system socket is an error (done 2026-10-23 14:15 EDT)
 

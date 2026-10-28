@@ -56,7 +56,7 @@ C ABI that other programs can embed.
   rather than one taken from the environment; ordering across user accounts comes
   later, after a separate plan (a system service or an admin-created shared group file).
 - State stays in RAM (BDFN, 2026-10-19): no per-call writes to physical disk, so the
-  state lives in /tmp/uuidv7-<uid> (tmpfs or a RAM disk on the target machines) and
+  state lives in a per-user directory in /tmp (tmpfs or a RAM disk on the target machines) and
   does not survive a reboot.
 
 ## Open questions

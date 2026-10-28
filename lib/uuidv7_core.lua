@@ -211,14 +211,16 @@ function MemoryCounter:get_next(current_nt, is_static, random_u64)
 end
 
 -- ===== per-user state directory =====
--- The counter file and the daemon socket live in one per-user directory at a fixed
--- path, never taken from TMPDIR, HOME or XDG_* (those differ between shells, Nix
--- dev shells, cron and services, which would split the counter): /tmp/uuidv7-<uid>
--- on Linux and macOS (RAM-backed where /tmp is tmpfs or a RAM disk), and
--- <Local AppData>\Temp\uuidv7 on Windows. UUIDV7_STATE_DIR overrides it (tests,
--- deliberate isolation). On POSIX the directory is used only when it is a real
--- directory owned by the effective user with no group or other access, because
--- /tmp is shared and anyone could create the name first.
+-- The counter file and the daemon socket live in one per-user directory, never
+-- found through TMPDIR, HOME or XDG_* (those differ between shells, Nix dev
+-- shells, cron and services, which would split the counter). On Linux and macOS
+-- it is /tmp/uuidv7-<uid>-<uuidv7> (RAM-backed where /tmp is tmpfs or a RAM disk):
+-- /tmp is shared, so the name is unguessable, remembered in a private directory of
+-- the user's, and replaced when another user takes it. On Windows it is
+-- <Local AppData>\Temp\uuidv7. UUIDV7_STATE_DIR overrides it (tests, deliberate
+-- isolation). On POSIX the directory is used only when it is a real directory
+-- owned by the effective user with no group or other access.
+-- (context: docs/plan_context/counter_scope.md)
 if is_windows then
 	ffi.cdef[[
 		int SHGetFolderPathA(void *hwnd, int csidl, void *token, uint32_t flags, char *path);
@@ -229,7 +231,20 @@ else
 		uint32_t geteuid(void);
 		int fstat(int fd, void *buf);
 		int openat(int dirfd, const char *pathname, int flags, ...);
+		int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath);
 	]]
+	if is_macos then
+		ffi.cdef[[
+			struct passwd { char *pw_name; char *pw_passwd; uint32_t pw_uid; uint32_t pw_gid; long pw_change;
+				char *pw_class; char *pw_gecos; char *pw_dir; char *pw_shell; long pw_expire; };
+		]]
+	else
+		ffi.cdef[[
+			struct passwd { char *pw_name; char *pw_passwd; uint32_t pw_uid; uint32_t pw_gid;
+				char *pw_gecos; char *pw_dir; char *pw_shell; };
+		]]
+	end
+	ffi.cdef[[ struct passwd *getpwuid(uint32_t uid); ]]
 end
 local CSIDL_LOCAL_APPDATA = 0x1c
 local STATE_DIR_MODE = 448   -- 0700
@@ -240,19 +255,6 @@ if is_macos then ST_MODE_OFF, ST_MODE_U16, ST_UID_OFF = 4, true, 16
 elseif jit.arch == "arm64" then ST_MODE_OFF, ST_MODE_U16, ST_UID_OFF = 16, false, 24
 else ST_MODE_OFF, ST_MODE_U16, ST_UID_OFF = 24, false, 28 end
 local S_IFMT, S_IFDIR = 0xF000, 0x4000
-
--- The state directory path (not created), or nil when none can be found.
-function M.state_dir()
-	local o = os.getenv("UUIDV7_STATE_DIR")
-	if o and o ~= "" then return (o:gsub("[/\\]+$", "")) end
-	if is_windows then
-		local buf = ffi.new("char[260]")
-		local ok, rc = pcall(function() return ffi.load("shell32").SHGetFolderPathA(nil, CSIDL_LOCAL_APPDATA, nil, 0, buf) end)
-		if not ok or rc ~= 0 then return nil end
-		return ffi.string(buf) .. "\\Temp\\uuidv7"
-	end
-	return "/tmp/uuidv7-" .. tostring(C.geteuid())
-end
 
 -- Create the directory and any missing parents (0700 on POSIX; Windows
 -- directories inherit the per-user Local AppData ACL). Existing ones are kept.
@@ -300,6 +302,105 @@ local function create_state_file(dfd, name)
 		if fd >= 0 or ffi.errno() ~= ENOENT then break end
 	end
 	return fd
+end
+
+-- ----- the remembered state directory name (Linux, macOS) -----
+local POINTER, POINTER_TMP, POINTER_LOCK = "state-dir", "state-dir.tmp", "state-dir.lock"
+local O_WRONLY, O_TRUNC = 0x0001, is_macos and 0x0400 or 0x0200
+
+-- Where the state directory's name is remembered: UUIDV7_STATE_HOME, else
+-- ~/.local/state/uuidv7 with ~ from the account database (getpwuid), not $HOME.
+local function state_home()
+	local o = os.getenv("UUIDV7_STATE_HOME")
+	if o and o ~= "" then return (o:gsub("/+$", "")) end
+	local pw = C.getpwuid(C.geteuid())
+	if pw == nil or pw.pw_dir == nil then return nil end
+	return ffi.string(pw.pw_dir):gsub("/+$", "") .. "/.local/state/uuidv7"
+end
+
+-- The remembered name, if it is exactly /tmp/uuidv7-<uid>-<32 lowercase hex>.
+local function read_pointer(hfd, uid)
+	local fd = C.openat(hfd, POINTER, O_NOFOLLOW, ffi.new("int", 0))
+	if fd < 0 then return nil end
+	local buf = ffi.new("char[128]")
+	local n = C.read(fd, buf, 128)
+	C.close(fd)
+	if n <= 0 then return nil end
+	return ffi.string(buf, n):match("^(/tmp/uuidv7%-" .. uid .. "%-" .. ("[0-9a-f]"):rep(32) .. ")\n?$")
+end
+
+-- Whether `path` is this user's directory: "ours" (created if missing, as after a
+-- reboot), or "taken" when something else is there: another user's directory, a
+-- symlink or a file. Permissions are left to open_private_dir.
+local function claim_dir(path)
+	local function open_dir() return C.open(path, bit.bor(O_DIRECTORY, O_NOFOLLOW), ffi.new("int", 0)) end
+	local fd = open_dir()
+	if fd < 0 and ffi.errno() == ENOENT then C.mkdir(path, STATE_DIR_MODE); fd = open_dir() end
+	if fd < 0 then return "taken" end
+	local st = ffi.new("uint8_t[256]")
+	local ours = C.fstat(fd, st) == 0 and ffi.cast("uint32_t*", st + ST_UID_OFF)[0] == C.geteuid()
+	C.close(fd)
+	return ours and "ours" or "taken"
+end
+
+-- Remember `path` atomically: write a temporary file, then rename it into place.
+local function write_pointer(hfd, path)
+	local fd = C.openat(hfd, POINTER_TMP, bit.bor(O_CREAT, O_WRONLY, O_TRUNC, O_NOFOLLOW), ffi.new("int", 384))   -- 0600
+	if fd < 0 then return false end
+	local text = path .. "\n"
+	local ok = C.write(fd, text, #text) == #text
+	C.close(fd)
+	return ok and C.renameat(hfd, POINTER_TMP, hfd, POINTER) == 0
+end
+
+-- The unguessable state directory /tmp/uuidv7-<uid>-<uuidv7>, remembered in
+-- state_home(). A new name is chosen, under flock and re-checked after locking so
+-- concurrent first calls agree, when none is remembered or another user has taken
+-- the remembered one. The UUIDv7 comes from an in-memory counter: only its random
+-- bits matter here. Returns the path, or nil and why.
+local function remembered_state_dir()
+	local uid = tostring(C.geteuid())
+	local home = state_home()
+	if not home then return nil, "no home directory to remember the counter state directory in (set UUIDV7_STATE_DIR)" end
+	local hfd = M.open_private_dir(home)
+	if not hfd then
+		return nil, "cannot use " .. home .. " to remember the counter state directory " ..
+			"(it must be a private directory owned by this user, with no symlinks)"
+	end
+	local dir = read_pointer(hfd, uid)
+	if dir and claim_dir(dir) == "ours" then C.close(hfd); return dir end
+	local lfd = create_state_file(hfd, POINTER_LOCK)
+	if lfd < 0 then C.close(hfd); return nil, "cannot lock " .. home .. "/" .. POINTER_LOCK end
+	C.flock(lfd, C.LOCK_EX)
+	dir = read_pointer(hfd, uid)
+	if not (dir and claim_dir(dir) == "ours") then
+		dir = nil
+		for _ = 1, CREATE_ATTEMPTS do
+			local name = "/tmp/uuidv7-" .. uid .. "-" .. M.format_uuid((M.generate_bytes(MemoryCounter:new())), false)
+			if C.mkdir(name, STATE_DIR_MODE) == 0 then
+				if write_pointer(hfd, name) then dir = name end
+				break
+			end
+		end
+	end
+	C.flock(lfd, C.LOCK_UN)
+	C.close(lfd)
+	C.close(hfd)
+	if not dir then return nil, "cannot choose a counter state directory in /tmp (remembered in " .. home .. ")" end
+	return dir
+end
+
+-- The state directory path, or nil and why when none can be found.
+function M.state_dir()
+	local o = os.getenv("UUIDV7_STATE_DIR")
+	if o and o ~= "" then return (o:gsub("[/\\]+$", "")) end
+	if is_windows then
+		local buf = ffi.new("char[260]")
+		local ok, rc = pcall(function() return ffi.load("shell32").SHGetFolderPathA(nil, CSIDL_LOCAL_APPDATA, nil, 0, buf) end)
+		if not ok or rc ~= 0 then return nil, "no Local AppData folder found (set UUIDV7_STATE_DIR)" end
+		return ffi.string(buf) .. "\\Temp\\uuidv7"
+	end
+	return remembered_state_dir()
 end
 
 -- Path of a file in the state directory, or nil.
@@ -442,10 +543,10 @@ end
 -- private or is a symlink, or a symlinked sequence file). A UUID from a counter
 -- of the process's own would not be ordered with other processes' UUIDs, so none
 -- is generated: ordering is the promise. uuidv7z prints the same text.
-function M.unusable_state_error(dir)
-	local why = dir and ("cannot use the counter state in " .. dir ..
+function M.unusable_state_error(dir, why)
+	why = dir and ("cannot use the counter state in " .. dir ..
 		" (it must be a private directory owned by this user, with no symlinks)")
-		or "no counter state directory found (set UUIDV7_STATE_DIR)"
+		or why or "no counter state directory found (set UUIDV7_STATE_DIR)"
 	return why .. "; no UUID generated, since it would not be ordered with other processes' UUIDs"
 end
 
@@ -455,14 +556,15 @@ local function note_state(self, usable)
 	if usable then self._unusable = false; return end
 	if self._unusable then return end
 	self._unusable = true
-	if self.on_unusable then self.on_unusable(M.unusable_state_error(self.dir)) end
+	if self.on_unusable then self.on_unusable(M.unusable_state_error(self.dir, self.dir_why)) end
 end
 
 -- Filesystem (Linux and macOS CLI default): flock'd file in the state directory, atomic cross-process RMW.
 local FsCounter = {}
 FsCounter.__index = FsCounter
 function FsCounter:new()
-	return setmetatable({ dir = M.state_dir() }, self)
+	local dir, why = M.state_dir()
+	return setmetatable({ dir = dir, dir_why = why }, self)
 end
 -- Parse the "ns:counter" state text into (int64, uint64), or nil for empty/garbled.
 local function parse_state(s)
@@ -484,7 +586,7 @@ function FsCounter:locked(fn)
 	end
 	local mem = MemoryCounter:new()
 	note_state(self, fd >= 0)
-	if fd < 0 then return nil, M.unusable_state_error(self.dir) end
+	if fd < 0 then return nil, M.unusable_state_error(self.dir, self.dir_why) end
 	C.flock(fd, C.LOCK_EX)
 	C.lseek(fd, 0, C.SEEK_SET)
 	local buf = ffi.new("char[?]", 96)
@@ -505,7 +607,8 @@ end
 local WinCounter = {}
 WinCounter.__index = WinCounter
 function WinCounter:new()
-	return setmetatable({ dir = M.state_dir(), filepath = M.state_file("sequence") }, self)
+	local dir, why = M.state_dir()
+	return setmetatable({ dir = dir, dir_why = why, filepath = dir and (dir .. "/sequence") }, self)
 end
 function WinCounter:locked(fn)
 	local GENERIC_RW, SHARE_RW, OPEN_ALWAYS, LOCKFILE_EXCLUSIVE = 0xC0000000, 3, 4, 2
@@ -523,7 +626,7 @@ function WinCounter:locked(fn)
 	end
 	local mem = MemoryCounter:new()
 	note_state(self, h ~= nil)
-	if h == nil then return nil, M.unusable_state_error(self.dir) end
+	if h == nil then return nil, M.unusable_state_error(self.dir, self.dir_why) end
 	local ov = ffi.new("uuidv7_OVERLAPPED")
 	C.LockFileEx(h, LOCKFILE_EXCLUSIVE, 0, 0xFFFFFFFF, 0xFFFFFFFF, ov)
 	local buf = ffi.new("char[?]", 96)
